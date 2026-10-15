@@ -156,7 +156,8 @@ final class PageViewport: UIView {
     override init(frame: CGRect) {
         super.init(frame: frame)
         clipsToBounds = true
-        backgroundColor = UIColor(white: 0.105, alpha: 1)
+        // Match the sheet in the letterbox area; avoid a dark strip below the page.
+        backgroundColor = UIColor(red: 1, green: 0.995, blue: 0.956, alpha: 1)
         surface.backgroundColor = UIColor(red: 1, green: 0.995, blue: 0.956, alpha: 1)
         addSubview(surface)
     }
@@ -282,7 +283,6 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
     private var selectedPage: UUID?
     private var selectedPages = Set<UUID>()
     private var selectingPages = false
-    private var deletedMode = false
     private let paper = PaperView()
     private let canvas = DrawingCanvas()
     private var pageViewport: PageViewport?
@@ -570,6 +570,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         pageID = nil
         documentOpened(nil)
         clear()
+        view.backgroundColor = UIColor(white: 0.105, alpha: 1)
         let head = button("plus", label: "New document") { [weak self] in self?.askName() }
         let sync = button("arrow.triangle.2.circlepath", label: "Sync with DGX") { [weak self] in self?.syncWithServer() }
         let folder = store.folders.first { $0.id == homeFolderID }
@@ -664,7 +665,10 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
             }
             options.menu = UIMenu(children: [
                 UIAction(title: "Rename", image: UIImage(systemName: "pencil")) { [weak self] _ in self?.askRename(book.id) },
-                UIMenu(title: "Move to", image: UIImage(systemName: "folder"), children: destinations)
+                UIMenu(title: "Move to", image: UIImage(systemName: "folder"), children: destinations),
+                UIAction(title: "Delete notebook", image: UIImage(systemName: "trash"), attributes: .destructive) { [weak self] _ in
+                    self?.confirmNotebookDeletion(book.id)
+                }
             ])
             options.showsMenuAsPrimaryAction = true
             let item = UIStackView(arrangedSubviews: [b, options])
@@ -686,6 +690,24 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         syncStatus.font = .preferredFont(forTextStyle: .footnote)
         syncStatus.textColor = .secondaryLabel
         vertical([top, scroll, syncStatus])
+    }
+
+    private func confirmNotebookDeletion(_ id: UUID) {
+        guard let book = store.notebook(id) else { return }
+        let alert = UIAlertController(title: "Delete notebook?",
+            message: "Delete \"\(book.name)\" and its \(book.pages.count) pages? This cannot be undone in the app.",
+            preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Delete notebook", style: .destructive) { [weak self] _ in
+            guard let self else { return }
+            do {
+                try self.store.deleteNotebook(id)
+                self.showHome()
+            } catch {
+                DispatchQueue.main.async { [weak self] in self?.failure(error) }
+            }
+        })
+        present(alert, animated: true)
     }
 
     private func syncWithServer() {
@@ -1341,6 +1363,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
 
     private func showSettings() {
         clear()
+        view.backgroundColor = UIColor(white: 0.105, alpha: 1)
         let back = button("chevron.left", label: "Documents") { [weak self] in self?.showHome() }
         let title = UILabel()
         title.text = "Settings"
@@ -1531,6 +1554,9 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
             UIAction(title: "Settings", image: UIImage(systemName: "gearshape")) { [weak self] _ in
                 self?.finishSave()
                 self?.showSettings()
+            },
+            UIAction(title: "Delete notebook", image: UIImage(systemName: "trash"), attributes: .destructive) { [weak self] _ in
+                self?.confirmNotebookDeletion(book.id)
             }
         ])
         more.showsMenuAsPrimaryAction = true
@@ -1539,12 +1565,12 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         header.alignment = .fill
         header.spacing = 4
         header.backgroundColor = UIColor(white: 0.105, alpha: 1)
-        header.heightAnchor.constraint(equalToConstant: 52).isActive = true
-        home.widthAnchor.constraint(equalToConstant: 46).isActive = true
+        header.heightAnchor.constraint(equalToConstant: 44).isActive = true
+        home.widthAnchor.constraint(equalToConstant: 44).isActive = true
         for control in [previous, next, addPage, more] {
-            control.widthAnchor.constraint(equalToConstant: 46).isActive = true
+            control.widthAnchor.constraint(equalToConstant: 44).isActive = true
         }
-        if !overview.isHidden { overview.widthAnchor.constraint(equalToConstant: 46).isActive = true }
+        if !overview.isHidden { overview.widthAnchor.constraint(equalToConstant: 44).isActive = true }
         return header
     }
 
@@ -1558,6 +1584,8 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         if book.currentPage != page.id { mutate { try store.update(bookID) { $0.currentPage = page.id } } }
         let keepOverview = overviewVisible
         clear()
+        // Extend the warm paper behind the iPad home-indicator safe area.
+        view.backgroundColor = UIColor(red: 1, green: 0.995, blue: 0.956, alpha: 1)
         let work = PageViewport()
         work.accessibilityIdentifier = "pageViewport"
         work.surface.accessibilityIdentifier = "drawingSurface"
@@ -2450,6 +2478,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         pageID = nil
         documentOpened(bookID)
         clear()
+        view.backgroundColor = UIColor(white: 0.105, alpha: 1)
         vertical([overviewView(book: book, offset: offset)])
     }
 
@@ -2486,10 +2515,10 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
 
     private func overviewView(book: Notebook, offset previousOffset: CGFloat) -> UIView {
         let bookID = book.id
-        let pages = deletedMode ? book.deleted : book.pages
+        let pages = book.pages
         let home = button(pageArea == nil ? "chevron.left" : "ellipsis", label: "Overview options") { [weak self] in
             guard let self else { return }
-            if self.pageArea == nil { self.deletedMode = false; self.showHome() }
+            if self.pageArea == nil { self.showHome() }
         }
         if pageArea != nil {
             home.menu = UIMenu(children: [
@@ -2498,18 +2527,14 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
             ])
             home.showsMenuAsPrimaryAction = true
         }
-        let deleted = button(deletedMode ? "square.grid.2x2" : "trash", label: deletedMode ? "Pages" : "Deleted pages") { [weak self] in
-            self?.deletedMode.toggle(); self?.selectedPage = nil; self?.selectedPages.removeAll()
-            self?.selectingPages = false; self?.overviewScroll = nil; self?.refreshOverview()
-        }
         let add = button("plus", label: "New page") { [weak self] in
-            guard let self, let bookID = self.bookID, self.store.notebook(bookID) != nil, !self.deletedMode else { return }
+            guard let self, let bookID = self.bookID, self.store.notebook(bookID) != nil else { return }
             let page = Page()
             self.mutate { try self.store.update(bookID) { $0.pages.append(page); $0.currentPage = page.id } }
             self.openPage(page.id)
         }
         // The page editor already has New page in its top bar.
-        add.isHidden = deletedMode || pageArea != nil
+        add.isHidden = pageArea != nil
         let select = button(selectingPages ? "checkmark.circle.fill" : "checkmark.circle", label: selectingPages ? "Done selecting" : "Select pages") { [weak self] in
             guard let self else { return }
             self.selectingPages.toggle()
@@ -2524,12 +2549,12 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         title.textAlignment = .center
         title.font = .preferredFont(forTextStyle: .headline)
         title.text = selectingPages ? "\(selectedPages.count) selected"
-            : deletedMode ? "Deleted (\(pages.count))" : pageArea == nil ? "\(book.name) • \(pages.count) pages" : "Overview"
+            : pageArea == nil ? "\(book.name) • \(pages.count) pages" : "Overview"
         title.textColor = .white
-        let header = UIStackView(arrangedSubviews: [home, title, add, select, deleted])
+        let header = UIStackView(arrangedSubviews: [home, title, add, select])
         header.axis = .horizontal
         header.heightAnchor.constraint(equalToConstant: 48).isActive = true
-        for control in [home, deleted] { control.widthAnchor.constraint(equalToConstant: 48).isActive = true }
+        home.widthAnchor.constraint(equalToConstant: 48).isActive = true
         select.widthAnchor.constraint(equalToConstant: 64).isActive = true
         if !add.isHidden { add.widthAnchor.constraint(equalToConstant: 48).isActive = true }
         let modes = UISegmentedControl(items: [UIImage(systemName: "square.grid.2x2")!, UIImage(systemName: "list.bullet")!])
@@ -2571,7 +2596,6 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
                 cell.addAction(UIAction { [weak self] _ in
                     guard let self else { return }
                     if self.selectingPages { self.togglePageSelection(page.id) }
-                    else if self.deletedMode { self.selectedPage = page.id; self.refreshOverview() }
                     else { self.openPage(page.id) }
                 }, for: .touchUpInside)
                 let hold = UILongPressGestureRecognizer(target: self, action: #selector(selectPage(_:)))
@@ -2603,11 +2627,9 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
             grid.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor)
         ])
         overviewScroll = scroll
-        let actions: [(String, String, () -> Void)] = deletedMode ? [
-            ("arrow.uturn.backward", "Restore page", { [weak self] in self?.restorePage() })
-        ] : [
+        let actions: [(String, String, () -> Void)] = [
             ("document.on.document", "Duplicate to left", { [weak self] in self?.duplicatePage() }),
-            ("trash", "Move to Deleted", { [weak self] in self?.deletePage() }),
+            ("trash", "Delete page", { [weak self] in self?.deletePage() }),
             ("arrow.left", "Move left", { [weak self] in self?.movePage(-1) }),
             ("arrow.right", "Move right", { [weak self] in self?.movePage(1) })
         ]
@@ -2615,11 +2637,10 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         if selectingPages {
             let all = button("checkmark.rectangle.stack", label: "Select all pages") { [weak self] in
                 guard let self, let book = self.bookID.flatMap(self.store.notebook) else { return }
-                let visible = self.deletedMode ? book.deleted : book.pages
-                self.selectedPages = Set(visible.map(\.id))
+                self.selectedPages = Set(book.pages.map(\.id))
                 self.refreshOverview()
             }
-            let apply = button(deletedMode ? "arrow.uturn.backward" : "trash", label: deletedMode ? "Restore \(selectedPages.count) selected pages" : "Delete \(selectedPages.count) selected pages") { [weak self] in
+            let apply = button("trash", label: "Delete \(selectedPages.count) selected pages") { [weak self] in
                 self?.confirmBatchPageAction()
             }
             apply.isEnabled = !selectedPages.isEmpty
@@ -2651,52 +2672,39 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
 
     private func togglePageSelection(_ id: UUID) {
         guard let bookID, let book = store.notebook(bookID),
-              (deletedMode ? book.deleted : book.pages).contains(where: { $0.id == id }) else { return }
+              book.pages.contains(where: { $0.id == id }) else { return }
         if !selectedPages.insert(id).inserted { selectedPages.remove(id) }
         refreshOverview()
     }
 
     private func confirmBatchPageAction() {
-        guard selectingPages, let bookID, let book = store.notebook(bookID) else { return }
-        let available = deletedMode ? book.deleted : book.pages
-        let ids = selectedPages.intersection(Set(available.map(\.id)))
+        guard selectingPages, let bookID else { return }
+        confirmPageDeletion(selectedPages, bookID: bookID)
+    }
+
+    private func confirmPageDeletion(_ requested: Set<UUID>, bookID: UUID) {
+        guard let book = store.notebook(bookID) else { return }
+        let ids = requested.intersection(Set(book.pages.map(\.id)))
         guard !ids.isEmpty else { return }
-        let count = ids.count
-        let restoring = deletedMode
-        let all = !restoring && count == book.pages.count
-        let message = restoring ? "Restore \(count) pages to this notebook?"
-            : "Move \(count) pages to Deleted pages?\(all ? " A new blank page will be created." : "")"
-        let alert = UIAlertController(title: restoring ? "Restore pages" : "Delete pages", message: message, preferredStyle: .alert)
+        let all = ids.count == book.pages.count
+        let message = "Delete \(ids.count) page\(ids.count == 1 ? "" : "s") from this notebook? This cannot be undone in the app.\(all ? " A new blank page will be created." : "")"
+        let alert = UIAlertController(title: "Delete pages", message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        alert.addAction(UIAlertAction(title: restoring ? "Restore" : "Delete", style: restoring ? .default : .destructive) { [weak self] _ in
-            self?.batchPageAction(ids: ids, restoring: restoring, bookID: bookID)
+        alert.addAction(UIAlertAction(title: "Delete", style: .destructive) { [weak self] _ in
+            self?.batchPageAction(ids: ids, bookID: bookID)
         })
         present(alert, animated: true)
     }
 
-    private func batchPageAction(ids: Set<UUID>, restoring: Bool, bookID: UUID) {
+    private func batchPageAction(ids: Set<UUID>, bookID: UUID) {
         do {
             if pageArea != nil { try saveCanvasIfChanged() }
-            try store.update(bookID) { book in
-            if restoring {
-                let moved = book.deleted.filter { ids.contains($0.id) }
-                book.deleted.removeAll { ids.contains($0.id) }
-                book.pages.append(contentsOf: moved)
-            } else {
-                let moved = book.pages.filter { ids.contains($0.id) }
-                book.pages.removeAll { ids.contains($0.id) }
-                book.deleted.append(contentsOf: moved)
-                if book.pages.isEmpty { book.pages.append(Page()) }
-                if book.currentPage == nil || !book.pages.contains(where: { $0.id == book.currentPage }) {
-                    book.currentPage = book.pages.first?.id
-                }
-            }
-        }
+            try store.deletePages(book: bookID, selected: ids)
         } catch { failure(error); return }
         selectedPages.removeAll()
         selectingPages = false
         selectedPage = nil
-        if !restoring, let book = store.notebook(bookID), let current = book.currentPage,
+        if let book = store.notebook(bookID), let current = book.currentPage,
            pageArea != nil, pageID != current { openPage(current) }
         else { refreshOverview() }
     }
@@ -2710,25 +2718,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
 
     private func deletePage() {
         guard let bookID, let selectedPage else { return }
-        if pageArea != nil { finishSave() }
-        mutate { try store.update(bookID) { book in
-            guard book.pages.count > 1, let i = book.pages.firstIndex(where: { $0.id == selectedPage }) else { return }
-            book.deleted.append(book.pages.remove(at: i))
-            if book.currentPage == selectedPage { book.currentPage = book.pages[min(i, book.pages.count - 1)].id }
-        } }
-        self.selectedPage = nil
-        if pageID == selectedPage, let current = store.notebook(bookID)?.currentPage { openPage(current) }
-        else { refreshOverview() }
-    }
-
-    private func restorePage() {
-        guard let bookID, let selectedPage else { return }
-        mutate { try store.update(bookID) { book in
-            guard let i = book.deleted.firstIndex(where: { $0.id == selectedPage }) else { return }
-            book.pages.append(book.deleted.remove(at: i))
-        } }
-        self.selectedPage = nil
-        refreshOverview()
+        confirmPageDeletion([selectedPage], bookID: bookID)
     }
 
     private func movePage(_ delta: Int) {

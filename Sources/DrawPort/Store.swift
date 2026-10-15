@@ -216,6 +216,26 @@ final class Store {
         try commitOrganization(notebooks: books, folders: groups)
     }
 
+    /// Remove the notebook from the library atomically. Orphaned snapshots are
+    /// pruned only after the index is durable and every remaining page validates.
+    func deleteNotebook(_ id: UUID) throws {
+        guard notebooks.contains(where: { $0.id == id }) else { return }
+        try commitOrganization(notebooks: notebooks.filter { $0.id != id }, folders: folders)
+        cleanupSnapshots()
+    }
+
+    func deletePages(book id: UUID, selected ids: Set<UUID>) throws {
+        guard !ids.isEmpty, notebooks.contains(where: { $0.id == id && $0.pages.contains(where: { ids.contains($0.id) }) }) else { return }
+        try update(id) { book in
+            book.pages.removeAll { ids.contains($0.id) }
+            if book.pages.isEmpty { book.pages.append(Page()) }
+            if book.currentPage == nil || !book.pages.contains(where: { $0.id == book.currentPage }) {
+                book.currentPage = book.pages.first?.id
+            }
+        }
+        cleanupSnapshots()
+    }
+
     func moveNotebook(_ id: UUID, into folder: UUID?) throws {
         guard folder == nil || folders.contains(where: { $0.id == folder }) else { throw SyncError.invalidPackage }
         guard let i = notebooks.firstIndex(where: { $0.id == id }) else { return }
