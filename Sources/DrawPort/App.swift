@@ -1313,9 +1313,39 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         let setting = UIStackView(arrangedSubviews: [orientationLabel, orientationPicker, label, picker, paletteRow])
         setting.axis = .vertical
         setting.spacing = 12
+        for (name, key) in [
+            ("Notebook tabs", "showNotebookTabs"), ("Numbered page tabs", "showPageTabs"),
+            ("All pages shortcut", "showOverviewShortcut"), ("New page shortcut", "showNewPageShortcut"),
+            ("Selection tool", "showSelectionControl"), ("Ruler", "showRulerControl"),
+            ("Stroke size controls", "showSizeControls"), ("Carry to next page", "showCarryControl"),
+            ("Shapes tool", "showShapesControl")
+        ] {
+            let caption = UILabel()
+            caption.text = name
+            caption.font = .preferredFont(forTextStyle: .body)
+            let toggle = UISwitch()
+            toggle.isOn = controlVisible(key)
+            toggle.addAction(UIAction { [weak toggle] _ in
+                guard let toggle else { return }
+                UserDefaults.standard.set(toggle.isOn, forKey: key)
+            }, for: .valueChanged)
+            let line = UIStackView(arrangedSubviews: [caption, toggle])
+            line.axis = .horizontal
+            setting.addArrangedSubview(line)
+        }
         setting.isLayoutMarginsRelativeArrangement = true
         setting.layoutMargins = UIEdgeInsets(top: 24, left: 24, bottom: 24, right: 24)
-        vertical([row([back, title, UIView()], height: 48), setting, UIView()])
+        let scroll = UIScrollView()
+        scroll.addSubview(setting)
+        setting.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            setting.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
+            setting.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
+            setting.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor),
+            setting.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor),
+            setting.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor)
+        ])
+        vertical([row([back, title, UIView()], height: 48), scroll])
     }
 
     private func askName() {
@@ -1366,6 +1396,10 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         present(alert, animated: false)
     }
 
+    private func controlVisible(_ key: String) -> Bool {
+        (UserDefaults.standard.object(forKey: key) as? Bool) ?? true
+    }
+
     private func drawingHeader(book: Notebook, page: Page) -> UIView {
         func tabs(_ values: [(String, Bool, () -> Void)]) -> UIScrollView {
             let strip = UIStackView()
@@ -1409,6 +1443,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
             })
         })
         notebooks.accessibilityIdentifier = "notebookTabs"
+        notebooks.isHidden = !controlVisible("showNotebookTabs")
         let pages = tabs(book.pages.enumerated().map { index, entry in
             ("\(index + 1)", entry.id == page.id, { [weak self] in
                 guard let self, entry.id != self.pageID else { return }
@@ -1417,16 +1452,21 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
             })
         })
         pages.accessibilityIdentifier = "numberedPageTabs"
+        pages.isHidden = !controlVisible("showPageTabs")
         let add = button("plus", label: "New page") { [weak self] in self?.toolbarAction(3) }
         let overview = button("square.grid.2x2", label: "All numbered pages") { [weak self] in self?.toolbarAction(2) }
+        add.isHidden = !controlVisible("showNewPageShortcut")
+        overview.isHidden = !controlVisible("showOverviewShortcut")
         let header = UIStackView(arrangedSubviews: [home, notebooks, pages, add, overview])
         header.axis = .horizontal
         header.alignment = .fill
         header.spacing = 4
         header.backgroundColor = UIColor.secondarySystemBackground
         header.heightAnchor.constraint(equalToConstant: 48).isActive = true
-        for control in [home, add, overview] { control.widthAnchor.constraint(equalToConstant: 44).isActive = true }
-        notebooks.widthAnchor.constraint(equalTo: header.widthAnchor, multiplier: 0.44).isActive = true
+        home.widthAnchor.constraint(equalToConstant: 44).isActive = true
+        if !add.isHidden { add.widthAnchor.constraint(equalToConstant: 44).isActive = true }
+        if !overview.isHidden { overview.widthAnchor.constraint(equalToConstant: 44).isActive = true }
+        if !notebooks.isHidden { notebooks.widthAnchor.constraint(equalTo: header.widthAnchor, multiplier: 0.44).isActive = true }
         return header
     }
 
@@ -1667,6 +1707,9 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
             let b = button(symbols[i], label: names[i]) { [weak self] in self?.toolbarAction(action) }
             // Page navigation and paper templates live outside the pen strip.
             if i <= 4 { b.isHidden = true }
+            if i == 8 { b.isHidden = !controlVisible("showSelectionControl") }
+            if i == 9 { b.isHidden = !controlVisible("showRulerControl") }
+            if i == 10 || i == 11 { b.isHidden = !controlVisible("showSizeControls") }
             if i == 6 {
                 let hold = UILongPressGestureRecognizer(target: self, action: #selector(configureEraser(_:)))
                 hold.minimumPressDuration = 0.45
@@ -1735,6 +1778,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
             buttons.append(b)
         }
         let carry = button("doc.on.doc", label: "Carry to next page") { [weak self] in self?.toggleCarry() }
+        carry.isHidden = !controlVisible("showCarryControl")
         controls.append(carry)
         buttons.append(carry)
         let shapes = button("square.on.circle", label: "Shapes: line, curve, triangle, rectangle, ellipse") { [weak self] in
@@ -1745,6 +1789,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
             self.refreshToolbar()
         }
         shapes.accessibilityIdentifier = "shapeMode"
+        shapes.isHidden = !controlVisible("showShapesControl")
         controls.append(shapes)
         buttons.append(shapes)
         let strip = row(controls, height: position.isVertical ? 0 : 44)
