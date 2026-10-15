@@ -223,32 +223,10 @@ enum PaperDrawing {
     static let spacing: CGFloat = 36
 
     static func draw(context ctx: CGContext, size: CGSize, pattern: Int) {
+        // All paper is blank in this port, including previews and exports.
+        // Preserve the old `Page.background` field for lossless document decoding.
         ctx.setFillColor(UIColor.white.cgColor)
         ctx.fill(CGRect(origin: .zero, size: size))
-        guard pattern != 0 else { return }
-        ctx.setFillColor(UIColor(white: 0.78, alpha: 1).cgColor)
-        ctx.setStrokeColor(UIColor(white: 0.88, alpha: 1).cgColor)
-        ctx.setLineWidth(0.5)
-        let step = Self.spacing
-        if pattern == 1 {
-            for x in stride(from: step, through: CGRect(origin: .zero, size: size).width, by: step) {
-                for y in stride(from: step, through: CGRect(origin: .zero, size: size).height, by: step) {
-                    ctx.fillEllipse(in: CGRect(x: x, y: y, width: 1.5, height: 1.5))
-                }
-            }
-        } else {
-            for y in stride(from: step, through: CGRect(origin: .zero, size: size).height, by: step) {
-                ctx.move(to: CGPoint(x: 0, y: y))
-                ctx.addLine(to: CGPoint(x: CGRect(origin: .zero, size: size).width, y: y))
-            }
-            if pattern == 3 {
-                for x in stride(from: step, through: CGRect(origin: .zero, size: size).width, by: step) {
-                    ctx.move(to: CGPoint(x: x, y: 0))
-                    ctx.addLine(to: CGPoint(x: x, y: CGRect(origin: .zero, size: size).height))
-                }
-            }
-            ctx.strokePath()
-        }
     }
 }
 
@@ -297,7 +275,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
     private var homeFolderID: UUID?
     private var bookID: UUID?
     private var pageID: UUID?
-    private var batch = 0
+    private weak var overviewScroll: UIScrollView?
     private var selectedPage: UUID?
     private var deletedMode = false
     private let paper = PaperView()
@@ -1880,10 +1858,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
             let page = Page()
             mutate { try store.update(bookID) { $0.pages.insert(page, at: index + 1); $0.currentPage = page.id } }
             openPage(page.id)
-        case 4:
-            mutate { try store.update(bookID) { $0.pages[index].background = ($0.pages[index].background + 1) % 4 } }
-            paper.pattern = activePage()?.background ?? 0
-            buttons[4].accessibilityValue = ["Blank", "Dots", "Lines", "Grid"][paper.pattern]
+        case 4: break // No patterned-paper controls in DrawPort.
         case 5: selectTool(0)
         case 7:
             if usingTool { quickEraserQueued = true }
@@ -1903,9 +1878,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
             }
             applyTool()
             refreshToolbar()
-        case 20:
-            mutate { try store.update(bookID) { $0.pages[index].starred.toggle() } }
-            refreshToolbar()
+        case 20: break // Existing favorite metadata remains, but there is no UI to change it.
         case 21, 22:
             mutate {
                 try saveCanvasIfChanged()
@@ -2051,48 +2024,55 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         mutate { try saveCanvasIfChanged() }
     }
 
-    // Three columns by three rows. Only the current batch produces previews.
+    // All pages in a scrollable overview: no batches of nine or hidden page numbers.
     func showOverview() {
         guard let bookID, let book = store.notebook(bookID), DocumentOrientation.saved().fits(book.orientation) else { showHome(); return }
+        let previousOffset = overviewScroll?.contentOffset.y ?? 0
         pageID = nil
         documentOpened(bookID)
         clear()
         let pages = deletedMode ? book.deleted : book.pages
-        batch = min(batch, max(0, (pages.count - 1) / 9))
         let home = button("chevron.left", label: "Documents") { [weak self] in self?.deletedMode = false; self?.showHome() }
-        let prev = button("chevron.left.2", label: "Previous 9 pages") { [weak self] in self?.batch -= 1; self?.showOverview() }
-        prev.isEnabled = batch > 0
-        let next = button("chevron.right.2", label: "Next 9 pages") { [weak self] in self?.batch += 1; self?.showOverview() }
-        next.isEnabled = (batch + 1) * 9 < pages.count
         let deleted = button(deletedMode ? "square.grid.2x2" : "trash", label: deletedMode ? "Pages" : "Deleted pages") { [weak self] in
-            self?.deletedMode.toggle(); self?.batch = 0; self?.selectedPage = nil; self?.showOverview()
+            self?.deletedMode.toggle(); self?.selectedPage = nil; self?.overviewScroll = nil; self?.showOverview()
         }
+        let add = button("plus", label: "New page") { [weak self] in
+            guard let self, let bookID = self.bookID, self.store.notebook(bookID) != nil, !self.deletedMode else { return }
+            let page = Page()
+            self.mutate { try self.store.update(bookID) { $0.pages.append(page); $0.currentPage = page.id } }
+            self.openPage(page.id)
+        }
+        add.isHidden = deletedMode
         let title = UILabel()
         title.textAlignment = .center
         title.font = .preferredFont(forTextStyle: .headline)
-        title.text = deletedMode ? "Deleted" : book.name
-        let header = row([home, prev, title, next, deleted], height: 48)
+        title.text = deletedMode ? "Deleted pages (\(pages.count))" : "\(book.name) • \(pages.count) pages"
+        let header = UIStackView(arrangedSubviews: [home, title, add, deleted])
+        header.axis = .horizontal
+        header.heightAnchor.constraint(equalToConstant: 48).isActive = true
+        for control in [home, deleted] { control.widthAnchor.constraint(equalToConstant: 50).isActive = true }
+        if !deletedMode { add.widthAnchor.constraint(equalToConstant: 50).isActive = true }
         let grid = UIStackView()
         grid.accessibilityIdentifier = "pageOverviewGrid"
         grid.axis = .vertical
-        grid.distribution = .fillEqually
-        grid.spacing = 4
+        grid.distribution = .fill
+        grid.spacing = 8
         grid.backgroundColor = UIColor(white: 0.96, alpha: 1)
-        for r in 0..<3 {
+        for r in 0..<max(1, (pages.count + 2) / 3) {
             var cells: [UIView] = []
             for c in 0..<3 {
-                let n = batch * 9 + r * 3 + c
+                let n = r * 3 + c
                 guard n < pages.count else { cells.append(UIView()); continue }
                 let page = pages[n]
                 let cell = UIButton(type: .custom)
                 cell.backgroundColor = .white
-                cell.layer.borderWidth = page.id == selectedPage ? 3 : page.starred ? 2 : 0
-                cell.layer.borderColor = (page.id == selectedPage ? UIColor.black : UIColor.systemYellow).cgColor
-                cell.accessibilityLabel = "Page \(n + 1)\(page.starred ? ", starred" : "")"
+                cell.layer.borderWidth = page.id == selectedPage ? 3 : 0
+                cell.layer.borderColor = UIColor.systemBlue.cgColor
+                cell.accessibilityLabel = "Page \(n + 1)"
                 if let drawing = try? store.drawing(book: bookID, page: page) {
                     cell.setImage(try? PageComposite.image(drawing: drawing, objects: store.objects(book: bookID, page: page),
                         store: store, background: page.background,
-                        size: DocumentOrientation(metadata: book.orientation).pageSize, scale: 0.25), for: .normal)
+                        size: DocumentOrientation(metadata: book.orientation).pageSize, scale: 0.18), for: .normal)
                 } else {
                     cell.setTitle("Unreadable", for: .normal)
                 }
@@ -2117,8 +2097,20 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
                 numberedCell.spacing = 2
                 cells.append(numberedCell)
             }
-            grid.addArrangedSubview(row(cells, height: 0))
+            grid.addArrangedSubview(row(cells, height: 178))
         }
+        let scroll = UIScrollView()
+        scroll.accessibilityIdentifier = "allPagesScrollView"
+        scroll.addSubview(grid)
+        grid.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            grid.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
+            grid.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
+            grid.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor),
+            grid.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor),
+            grid.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor)
+        ])
+        overviewScroll = scroll
         let actions: [(String, String, () -> Void)] = deletedMode ? [
             ("arrow.uturn.backward", "Restore page", { [weak self] in self?.restorePage() })
         ] : [
@@ -2132,7 +2124,12 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
             b.isEnabled = selectedPage != nil
             return b
         }, height: 48)
-        vertical([header, grid, footer])
+        vertical([header, scroll, footer])
+        DispatchQueue.main.async { [weak scroll] in
+            guard let scroll else { return }
+            let maximum = max(0, scroll.contentSize.height - scroll.bounds.height)
+            scroll.setContentOffset(CGPoint(x: 0, y: min(previousOffset, maximum)), animated: false)
+        }
     }
 
     @objc private func selectPage(_ gesture: UILongPressGestureRecognizer) {
