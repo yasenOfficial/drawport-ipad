@@ -301,6 +301,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
     private var colorSwatches: [Int: UIView] = [:]
     private var editingColorIndex: Int?
     private weak var squeezeMenu: UIView?
+    private var squeezeInProgress = false
     private var eraserByPixel = UserDefaults.standard.bool(forKey: "eraserByPixel")
     private var shapeModeEnabled = false
     private var shapeStartStrokeCount = 0
@@ -498,6 +499,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         bottomPaperFill = nil
         squeezeMenu?.removeFromSuperview()
         squeezeMenu = nil
+        squeezeInProgress = false
         selectedPages.removeAll()
         selectingPages = false
         cancelCarry()
@@ -2151,7 +2153,12 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
 
 
     func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
-        guard squeeze.phase == .ended, pageViewport != nil, !usingTool else { return }
+        if squeeze.phase == .changed { return }
+        if squeeze.phase == .cancelled { squeezeInProgress = false; return }
+        // Show promptly for a continuous squeeze; an ended-only callback is a discrete squeeze.
+        if squeeze.phase == .ended && squeezeInProgress { squeezeInProgress = false; return }
+        if squeeze.phase == .began { squeezeInProgress = true }
+        guard pageViewport != nil, !usingTool else { return }
         if let menu = squeezeMenu {
             menu.removeFromSuperview()
             squeezeMenu = nil
@@ -2160,29 +2167,32 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         let location = squeeze.hoverPose.map { canvas.convert($0.location, to: view) }
             ?? CGPoint(x: view.bounds.midX, y: view.bounds.midY)
         let actions: [PencilSqueezeMenu.Action] = [
-            .init(symbol: "pencil.tip", label: "Pen", perform: { [weak self] in self?.selectTool(0) }),
-            .init(symbol: "highlighter", label: "Marker", perform: { [weak self] in self?.selectTool(2) }),
-            .init(symbol: "eraser.fill", label: "Eraser", perform: { [weak self] in self?.toolbarAction(7) }),
-            .init(symbol: "lasso", label: "Select", perform: { [weak self] in self?.selectTool(3) }),
-            .init(symbol: "paintpalette", label: "Color", perform: { [weak self] in
-                guard let self else { return }
-                if self.currentInk == 7 {
-                    let alert = UIAlertController(title: "Context ink", message: "The question ink's purple shade stays fixed.", preferredStyle: .alert)
-                    alert.addAction(UIAlertAction(title: "OK", style: .default))
-                    self.present(alert, animated: true)
-                } else {
-                    self.editingColorIndex = self.currentInk
-                    let picker = UIColorPickerViewController()
-                    picker.selectedColor = self.inkColors[self.currentInk]
-                    picker.supportsAlpha = false
-                    picker.delegate = self
-                    self.present(picker, animated: true)
-                }
-            }),
-            .init(symbol: "arrow.uturn.backward", label: "Undo", perform: { [weak self] in self?.toolbarAction(21) }),
-            .init(symbol: "arrow.uturn.forward", label: "Redo", perform: { [weak self] in self?.toolbarAction(22) })
+            .init(symbol: "arrow.uturn.backward", label: "Undo", selected: false, perform: { [weak self] in self?.toolbarAction(21) }),
+            .init(symbol: "arrow.uturn.forward", label: "Redo", selected: false, perform: { [weak self] in self?.toolbarAction(22) }),
+            .init(symbol: "pencil.tip", label: "Pen", selected: currentTool == 0 && !quickArmed, perform: { [weak self] in self?.selectTool(0) }),
+            .init(symbol: "highlighter", label: "Highlighter", selected: currentTool == 2 && !quickArmed, perform: { [weak self] in self?.selectTool(2) }),
+            .init(symbol: "eraser.fill", label: "Quick eraser", selected: quickArmed, perform: { [weak self] in self?.toolbarAction(7) }),
+            .init(symbol: "lasso", label: "Selection", selected: currentTool == 3, perform: { [weak self] in self?.selectTool(3) }),
+            .init(symbol: "hand.draw", label: "Carry to next page", selected: carryOverlay != nil, perform: { [weak self] in self?.toggleCarry() }),
+            .init(symbol: "sparkles", label: "AI suggestions", selected: false, perform: { [weak self] in self?.askAI() }),
+            .init(symbol: "plus.circle", label: "New page", selected: false, perform: { [weak self] in self?.toolbarAction(3) }),
+            .init(symbol: "square.grid.2x2", label: "Page overview", selected: false, perform: { [weak self] in self?.toolbarAction(2) })
         ]
-        let menu = PencilSqueezeMenu(in: view, near: location, actions: actions)
+        let swatches: [PencilSqueezeMenu.Swatch] = [(0, "Black"), (5, "Red"), (2, "Green"), (6, "Blue")].map { index, name in
+            .init(color: inkColors[index], label: name,
+                  selected: currentInk == index,
+                  select: { [weak self] in self?.selectInk(index) },
+                  configure: { [weak self] in
+                      guard let self else { return }
+                      self.editingColorIndex = index
+                      let picker = UIColorPickerViewController()
+                      picker.selectedColor = self.inkColors[index]
+                      picker.supportsAlpha = false
+                      picker.delegate = self
+                      self.present(picker, animated: true)
+                  })
+        }
+        let menu = PencilSqueezeMenu(in: view, near: location, actions: actions, swatches: swatches)
         squeezeMenu = menu
     }
 
