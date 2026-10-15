@@ -32,13 +32,13 @@ final class PencilRadialPalette: UIView {
             arc.strokeColor = UIColor(white: 0.105, alpha: 1).cgColor
             arc.lineCap = .round
             arc.shadowColor = UIColor.black.cgColor
-            arc.shadowOpacity = 0.34
-            arc.shadowRadius = 12
-            arc.shadowOffset = CGSize(width: 0, height: 7)
+            arc.shadowOpacity = 0.30
+            arc.shadowRadius = 6
+            arc.shadowOffset = CGSize(width: 0, height: 3)
             layer.addSublayer(arc)
         }
-        toolArc.lineWidth = 62
-        colorArc.lineWidth = 54
+        toolArc.lineWidth = 31
+        colorArc.lineWidth = 27
         makeControls()
     }
 
@@ -46,10 +46,37 @@ final class PencilRadialPalette: UIView {
 
     // The system canvas retains Pencil/finger input beyond the two curved bands.
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-        for control in controls.reversed() where !control.isHidden && control.frame.insetBy(dx: -5, dy: -5).contains(point) {
+        guard isUserInteractionEnabled, !isHidden, alpha > 0.05 else { return nil }
+        for control in controls.reversed() where !control.isHidden && control.frame.insetBy(dx: -2, dy: -2).contains(point) {
             return control
         }
         return nil
+    }
+
+    func appear() {
+        guard bounds.width > 0, bounds.height > 0 else { return }
+        let originalFrame = frame
+        layer.anchorPoint = CGPoint(x: min(1, max(0, requestedAnchor.x / bounds.width)),
+                                    y: min(1, max(0, requestedAnchor.y / bounds.height)))
+        frame = originalFrame
+        alpha = 0
+        transform = CGAffineTransform(scaleX: 0.78, y: 0.78)
+        UIView.animate(withDuration: 0.30, delay: 0, usingSpringWithDamping: 0.82,
+                       initialSpringVelocity: 0.45, options: [.allowUserInteraction, .beginFromCurrentState]) {
+            self.alpha = 1
+            self.transform = .identity
+        }
+    }
+
+    func dismiss(animated: Bool = true) {
+        guard animated else { removeFromSuperview(); return }
+        isUserInteractionEnabled = false
+        UIView.animate(withDuration: 0.16, delay: 0, options: [.beginFromCurrentState, .curveEaseIn]) {
+            self.alpha = 0
+            self.transform = CGAffineTransform(scaleX: 0.90, y: 0.90)
+        } completion: { _ in
+            self.removeFromSuperview()
+        }
     }
 
     private func makeControls() {
@@ -67,8 +94,10 @@ final class PencilRadialPalette: UIView {
         ]
         for (action, symbol, label, selected) in tools {
             let button = UIButton(type: .system)
-            let image = UIImage(systemName: symbol, withConfiguration: UIImage.SymbolConfiguration(pointSize: 24, weight: .medium))
+            let image = UIImage(systemName: symbol, withConfiguration: UIImage.SymbolConfiguration(pointSize: 13, weight: .medium))
             button.setImage(image, for: .normal)
+            button.contentHorizontalAlignment = .center
+            button.contentVerticalAlignment = .center
             button.tintColor = selected ? UIColor(red: 0.13, green: 0.44, blue: 1, alpha: 1) : .white
             button.accessibilityLabel = label == "Hand" ? "Hand navigation unavailable" : label
             button.accessibilityIdentifier = "pencilPalette.\(label.replacingOccurrences(of: " ", with: ""))"
@@ -86,15 +115,16 @@ final class PencilRadialPalette: UIView {
             let button = UIButton(type: .system)
             let swatch = UIView()
             swatch.backgroundColor = colors.indices.contains(index) ? colors[index] : .black
-            swatch.layer.cornerRadius = 16
+            swatch.layer.cornerRadius = 9
             swatch.layer.borderColor = UIColor(white: 0.45, alpha: 1).cgColor
-            swatch.layer.borderWidth = 1.4
+            swatch.layer.borderWidth = 0.8
             swatch.isUserInteractionEnabled = false
-            swatch.frame = CGRect(x: 6, y: 6, width: 32, height: 32)
+            // Both the swatch and its selection ring share the same center.
+            swatch.frame = CGRect(x: 4, y: 4, width: 18, height: 18)
             button.addSubview(swatch)
             if selectedColor == index {
-                button.layer.cornerRadius = 23
-                button.layer.borderWidth = 3
+                button.layer.cornerRadius = 13
+                button.layer.borderWidth = 2
                 button.layer.borderColor = UIColor(red: 0.16, green: 0.53, blue: 1, alpha: 1).cgColor
             }
             button.accessibilityLabel = "\(label) ink"
@@ -108,13 +138,13 @@ final class PencilRadialPalette: UIView {
     override func layoutSubviews() {
         super.layoutSubviews()
         guard bounds.width > 0, bounds.height > 0, controls.count == 14 else { return }
-        // Mirror around the Pencil near the leading/top edge instead of putting
-        // the arc outside the iPad. Never scale the icons or cover the entire page.
+        // Keep the 1:2 geometry coherent, including the safe-area clamping.
+        // The icons and wells are placed on the exact centerlines of both bands.
         let mirrorX = requestedAnchor.x < bounds.midX
-        let mirrorY = requestedAnchor.y < 270
+        let mirrorY = requestedAnchor.y < 150
         let center = CGPoint(
-            x: min(max(requestedAnchor.x, mirrorX ? 70 : 245), bounds.width - (mirrorX ? 245 : 145)),
-            y: min(max(requestedAnchor.y, mirrorY ? 75 : 260), bounds.height - (mirrorY ? 260 : 90))
+            x: min(max(requestedAnchor.x, mirrorX ? 48 : 141), bounds.width - (mirrorX ? 141 : 82)),
+            y: min(max(requestedAnchor.y, mirrorY ? 68 : 146), bounds.height - (mirrorY ? 146 : 54))
         )
         func point(radius: CGFloat, degrees: CGFloat) -> CGPoint {
             let angle = degrees * .pi / 180
@@ -130,16 +160,20 @@ final class PencilRadialPalette: UIView {
             }
             return result
         }
-        toolArc.path = path(radius: 164, start: 160, end: 316).cgPath
-        colorArc.path = path(radius: 228, start: 200, end: 248).cgPath
+        toolArc.path = path(radius: 82, start: 160, end: 316).cgPath
+        colorArc.path = path(radius: 114, start: 200, end: 248).cgPath
         let angles: [CGFloat] = [164, 180, 196, 212, 228, 244, 260, 276, 296, 314]
+        let scale = UIScreen.main.scale
+        func centeredFrame(_ location: CGPoint) -> CGRect {
+            CGRect(x: ((location.x - 13) * scale).rounded() / scale,
+                   y: ((location.y - 13) * scale).rounded() / scale,
+                   width: 26, height: 26)
+        }
         for (index, angle) in angles.enumerated() {
-            let location = point(radius: 164, degrees: angle)
-            controls[index].frame = CGRect(x: location.x - 23, y: location.y - 23, width: 46, height: 46)
+            controls[index].frame = centeredFrame(point(radius: 82, degrees: angle))
         }
         for (offset, angle) in ([201.0, 216.0, 232.0, 247.0] as [CGFloat]).enumerated() {
-            let location = point(radius: 228, degrees: angle)
-            controls[10 + offset].frame = CGRect(x: location.x - 23, y: location.y - 23, width: 46, height: 46)
+            controls[10 + offset].frame = centeredFrame(point(radius: 114, degrees: angle))
         }
     }
 }

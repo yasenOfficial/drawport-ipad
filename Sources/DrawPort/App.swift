@@ -2226,9 +2226,9 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
     func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
         guard pageViewport != nil, !nativePickerMinimizeTrial, squeeze.phase == .ended,
               UIPencilInteraction.preferredSqueezeAction != .ignore else { return }
-        if radialPalette != nil {
-            radialPalette?.removeFromSuperview()
+        if let palette = radialPalette {
             radialPalette = nil
+            palette.dismiss()
             return
         }
         let location = squeeze.hoverPose?.location ?? CGPoint(x: view.bounds.width * 0.65, y: view.bounds.height * 0.45)
@@ -2238,8 +2238,9 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         palette.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         palette.onAction = { [weak self] action in
             guard let self else { return }
-            self.radialPalette?.removeFromSuperview()
+            let shown = self.radialPalette
             self.radialPalette = nil
+            shown?.dismiss()
             switch action {
             case .undo: self.toolbarAction(21)
             case .redo: self.toolbarAction(22)
@@ -2260,6 +2261,8 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         }
         view.addSubview(palette)
         radialPalette = palette
+        palette.layoutIfNeeded()
+        palette.appear()
     }
 
     func toolPickerSelectedToolItemDidChange(_ toolPicker: PKToolPicker) {
@@ -2483,8 +2486,9 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
     }
 
     func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) {
-        radialPalette?.removeFromSuperview()
+        let palette = radialPalette
         radialPalette = nil
+        palette?.dismiss()
         usingTool = true
         shapeFinalizeWork?.cancel()
         shapeStartStrokeCount = canvas.drawing.strokes.count
