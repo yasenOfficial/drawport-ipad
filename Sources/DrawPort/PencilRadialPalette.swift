@@ -1,27 +1,74 @@
 import UIKit
 
-/// Squeeze-only tool overlay. It never registers an on-screen PKToolPicker and
-/// never intercepts touches on the paper outside its actual controls.
+/// Squeeze-only tool overlay: no persistent dock, and paper outside the controls
+/// keeps receiving Pencil and finger touches.
 final class PencilRadialPalette: UIView {
     enum Action {
-        case undo, redo, pen, highlighter, eraser, lasso, hand, shapes, addPage, overview
+        case undo, redo, pen, highlighter, eraser, lasso
+        case shapes, ruler, addPage, overview, ai
         case color(Int)
     }
 
+    enum ExtraTool: String, CaseIterable {
+        case shapes, ruler, addPage, overview, ai
+
+        var title: String {
+            switch self {
+            case .shapes: "Shapes"
+            case .ruler: "Ruler"
+            case .addPage: "New page"
+            case .overview: "Page overview"
+            case .ai: "AI suggestions"
+            }
+        }
+        var symbol: String {
+            switch self {
+            case .shapes: "square.on.circle"
+            case .ruler: "ruler"
+            case .addPage: "plus.square"
+            case .overview: "square.grid.2x2"
+            case .ai: "sparkles"
+            }
+        }
+        var action: Action {
+            switch self {
+            case .shapes: .shapes
+            case .ruler: .ruler
+            case .addPage: .addPage
+            case .overview: .overview
+            case .ai: .ai
+            }
+        }
+
+        static func saved() -> [ExtraTool] {
+            let names = UserDefaults.standard.stringArray(forKey: "pencilRadialExtraTools") ?? []
+            return allCases.filter { names.contains($0.rawValue) }
+        }
+        static func save(_ selected: Set<ExtraTool>) {
+            UserDefaults.standard.set(allCases.filter { selected.contains($0) }.map(\.rawValue),
+                                      forKey: "pencilRadialExtraTools")
+        }
+    }
+
     var onAction: ((Action) -> Void)?
+    var onCustomize: ((UIView) -> Void)?
     private let toolArc = CAShapeLayer()
     private let colorArc = CAShapeLayer()
-    private var controls: [UIButton] = []
-    private var requestedAnchor: CGPoint
+    private var toolButtons: [UIButton] = []
+    private var colorButtons: [UIButton] = []
+    private var extraTools: [ExtraTool]
+    private let requestedAnchor: CGPoint
     private let selectedTool: Int
     private let selectedColor: Int
     private let colors: [UIColor]
 
-    init(frame: CGRect, anchor: CGPoint, selectedTool: Int, selectedColor: Int, colors: [UIColor]) {
+    init(frame: CGRect, anchor: CGPoint, selectedTool: Int, selectedColor: Int,
+         colors: [UIColor], extraTools: [ExtraTool]) {
         requestedAnchor = anchor
         self.selectedTool = selectedTool
         self.selectedColor = selectedColor
         self.colors = colors
+        self.extraTools = extraTools
         super.init(frame: frame)
         accessibilityIdentifier = "pencilSqueezePalette"
         backgroundColor = .clear
@@ -33,22 +80,24 @@ final class PencilRadialPalette: UIView {
             arc.lineCap = .round
             arc.shadowColor = UIColor.black.cgColor
             arc.shadowOpacity = 0.30
-            arc.shadowRadius = 6
-            arc.shadowOffset = CGSize(width: 0, height: 3)
+            arc.shadowRadius = 8
+            arc.shadowOffset = CGSize(width: 0, height: 4)
             layer.addSublayer(arc)
         }
-        toolArc.lineWidth = 31
-        colorArc.lineWidth = 27
-        makeControls()
+        toolArc.lineWidth = 40
+        colorArc.lineWidth = 34
+        makeToolButtons()
+        makeColorButtons()
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    // The system canvas retains Pencil/finger input beyond the two curved bands.
+    // A transparent full-screen host must not steal strokes outside the arc.
     override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
         guard isUserInteractionEnabled, !isHidden, alpha > 0.05 else { return nil }
-        for control in controls.reversed() where !control.isHidden && control.frame.insetBy(dx: -2, dy: -2).contains(point) {
-            return control
+        for button in (toolButtons + colorButtons).reversed()
+            where !button.isHidden && button.frame.insetBy(dx: -3, dy: -3).contains(point) {
+            return button
         }
         return nil
     }
@@ -60,9 +109,9 @@ final class PencilRadialPalette: UIView {
                                     y: min(1, max(0, requestedAnchor.y / bounds.height)))
         frame = originalFrame
         alpha = 0
-        transform = CGAffineTransform(scaleX: 0.78, y: 0.78)
-        UIView.animate(withDuration: 0.30, delay: 0, usingSpringWithDamping: 0.82,
-                       initialSpringVelocity: 0.45, options: [.allowUserInteraction, .beginFromCurrentState]) {
+        transform = CGAffineTransform(scaleX: 0.82, y: 0.82)
+        UIView.animate(withDuration: 0.28, delay: 0, usingSpringWithDamping: 0.84,
+                       initialSpringVelocity: 0.42, options: [.allowUserInteraction, .beginFromCurrentState]) {
             self.alpha = 1
             self.transform = .identity
         }
@@ -71,7 +120,7 @@ final class PencilRadialPalette: UIView {
     func dismiss(animated: Bool = true) {
         guard animated else { removeFromSuperview(); return }
         isUserInteractionEnabled = false
-        UIView.animate(withDuration: 0.16, delay: 0, options: [.beginFromCurrentState, .curveEaseIn]) {
+        UIView.animate(withDuration: 0.15, delay: 0, options: [.beginFromCurrentState, .curveEaseIn]) {
             self.alpha = 0
             self.transform = CGAffineTransform(scaleX: 0.90, y: 0.90)
         } completion: { _ in
@@ -79,72 +128,88 @@ final class PencilRadialPalette: UIView {
         }
     }
 
-    private func makeControls() {
-        let tools: [(Action, String, String, Bool)] = [
+    func updateExtras(_ tools: [ExtraTool]) {
+        extraTools = tools
+        for button in toolButtons { button.removeFromSuperview() }
+        toolButtons.removeAll()
+        makeToolButtons()
+        setNeedsLayout()
+        layoutIfNeeded()
+    }
+
+    private func makeToolButtons() {
+        var tools: [(Action, String, String, Bool)] = [
             (.undo, "arrow.uturn.backward", "Undo", false),
             (.redo, "arrow.uturn.forward", "Redo", false),
             (.pen, "pencil.tip", "Pen", selectedTool == 0),
             (.highlighter, "highlighter", "Highlighter", selectedTool == 2),
             (.eraser, "eraser.fill", "Eraser", selectedTool == 1),
-            (.lasso, "lasso", "Selection", selectedTool == 3),
-            (.hand, "hand.draw", "Hand", false),
-            (.shapes, "scribble.variable", "Shapes", false),
-            (.addPage, "plus.circle", "New page", false),
-            (.overview, "square.grid.2x2", "Page overview", false)
+            (.lasso, "lasso", "Selection", selectedTool == 3)
         ]
+        tools += extraTools.map { ($0.action, $0.symbol, $0.title, false) }
         for (action, symbol, label, selected) in tools {
             let button = UIButton(type: .system)
-            let image = UIImage(systemName: symbol, withConfiguration: UIImage.SymbolConfiguration(pointSize: 13, weight: .medium))
-            button.setImage(image, for: .normal)
+            button.setImage(UIImage(systemName: symbol,
+                withConfiguration: UIImage.SymbolConfiguration(pointSize: 17, weight: .medium)), for: .normal)
             button.contentHorizontalAlignment = .center
             button.contentVerticalAlignment = .center
             button.tintColor = selected ? UIColor(red: 0.13, green: 0.44, blue: 1, alpha: 1) : .white
-            button.accessibilityLabel = label == "Hand" ? "Hand navigation unavailable" : label
+            button.accessibilityLabel = label
             button.accessibilityIdentifier = "pencilPalette.\(label.replacingOccurrences(of: " ", with: ""))"
-            if label == "Hand" {
-                button.isEnabled = false
-                button.alpha = 0.48
-            } else {
-                button.addAction(UIAction { [weak self] _ in self?.onAction?(action) }, for: .touchUpInside)
-            }
+            button.addAction(UIAction { [weak self] _ in self?.onAction?(action) }, for: .touchUpInside)
             addSubview(button)
-            controls.append(button)
+            toolButtons.append(button)
         }
-        // The reference has a second, shorter crescent with four color wells.
+        let plus = UIButton(type: .system)
+        plus.setImage(UIImage(systemName: "plus.circle",
+            withConfiguration: UIImage.SymbolConfiguration(pointSize: 19, weight: .medium)), for: .normal)
+        plus.tintColor = .white
+        plus.accessibilityLabel = "Add popup tools"
+        plus.accessibilityIdentifier = "pencilPalette.AddTools"
+        plus.addAction(UIAction { [weak self, weak plus] _ in
+            guard let self, let plus else { return }
+            self.onCustomize?(plus)
+        }, for: .touchUpInside)
+        addSubview(plus)
+        toolButtons.append(plus)
+    }
+
+    private func makeColorButtons() {
         for (index, label) in [(0, "Black"), (5, "Red"), (2, "Green"), (6, "Blue")] {
             let button = UIButton(type: .system)
             let swatch = UIView()
             swatch.backgroundColor = colors.indices.contains(index) ? colors[index] : .black
-            swatch.layer.cornerRadius = 9
+            swatch.layer.cornerRadius = 12
             swatch.layer.borderColor = UIColor(white: 0.45, alpha: 1).cgColor
-            swatch.layer.borderWidth = 0.8
+            swatch.layer.borderWidth = 1
             swatch.isUserInteractionEnabled = false
-            // Both the swatch and its selection ring share the same center.
-            swatch.frame = CGRect(x: 4, y: 4, width: 18, height: 18)
+            swatch.frame = CGRect(x: 5, y: 5, width: 24, height: 24)
             button.addSubview(swatch)
             if selectedColor == index {
-                button.layer.cornerRadius = 13
-                button.layer.borderWidth = 2
+                button.layer.cornerRadius = 17
+                button.layer.borderWidth = 2.5
                 button.layer.borderColor = UIColor(red: 0.16, green: 0.53, blue: 1, alpha: 1).cgColor
             }
             button.accessibilityLabel = "\(label) ink"
             button.accessibilityIdentifier = "pencilPalette.\(label)"
             button.addAction(UIAction { [weak self] _ in self?.onAction?(.color(index)) }, for: .touchUpInside)
             addSubview(button)
-            controls.append(button)
+            colorButtons.append(button)
         }
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        guard bounds.width > 0, bounds.height > 0, controls.count == 14 else { return }
-        // Keep the 1:2 geometry coherent, including the safe-area clamping.
-        // The icons and wells are placed on the exact centerlines of both bands.
+        guard bounds.width > 0, bounds.height > 0, !toolButtons.isEmpty else { return }
+        // Increase the radius only if the user adds enough buttons to need it.
+        let radius = CGFloat(108 + max(0, toolButtons.count - 8) * 8)
+        let colorRadius = radius + 39
+        let reach = colorRadius + 35
         let mirrorX = requestedAnchor.x < bounds.midX
-        let mirrorY = requestedAnchor.y < 150
+        let mirrorY = requestedAnchor.y < reach
         let center = CGPoint(
-            x: min(max(requestedAnchor.x, mirrorX ? 48 : 141), bounds.width - (mirrorX ? 141 : 82)),
-            y: min(max(requestedAnchor.y, mirrorY ? 68 : 146), bounds.height - (mirrorY ? 146 : 54))
+            x: min(max(requestedAnchor.x, mirrorX ? 80 : reach), bounds.width - (mirrorX ? reach : 80)),
+            y: min(max(requestedAnchor.y, mirrorY ? 80 : reach), bounds.height - (mirrorY ? reach : 65))
         )
         func point(radius: CGFloat, degrees: CGFloat) -> CGPoint {
             let angle = degrees * .pi / 180
@@ -160,20 +225,21 @@ final class PencilRadialPalette: UIView {
             }
             return result
         }
-        toolArc.path = path(radius: 82, start: 160, end: 316).cgPath
-        colorArc.path = path(radius: 114, start: 200, end: 248).cgPath
-        let angles: [CGFloat] = [164, 180, 196, 212, 228, 244, 260, 276, 296, 314]
+        toolArc.path = path(radius: radius, start: 160, end: 318).cgPath
+        colorArc.path = path(radius: colorRadius, start: 200, end: 248).cgPath
         let scale = UIScreen.main.scale
         func centeredFrame(_ location: CGPoint) -> CGRect {
-            CGRect(x: ((location.x - 13) * scale).rounded() / scale,
-                   y: ((location.y - 13) * scale).rounded() / scale,
-                   width: 26, height: 26)
+            CGRect(x: ((location.x - 17) * scale).rounded() / scale,
+                   y: ((location.y - 17) * scale).rounded() / scale,
+                   width: 34, height: 34)
         }
-        for (index, angle) in angles.enumerated() {
-            controls[index].frame = centeredFrame(point(radius: 82, degrees: angle))
+        let count = toolButtons.count
+        for (index, button) in toolButtons.enumerated() {
+            let angle = CGFloat(164) + CGFloat(index) * 150 / CGFloat(max(1, count - 1))
+            button.frame = centeredFrame(point(radius: radius, degrees: angle))
         }
         for (offset, angle) in ([201.0, 216.0, 232.0, 247.0] as [CGFloat]).enumerated() {
-            controls[10 + offset].frame = centeredFrame(point(radius: 114, degrees: angle))
+            colorButtons[offset].frame = centeredFrame(point(radius: colorRadius, degrees: angle))
         }
     }
 }

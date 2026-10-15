@@ -2234,8 +2234,22 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         let location = squeeze.hoverPose?.location ?? CGPoint(x: view.bounds.width * 0.65, y: view.bounds.height * 0.45)
         let palette = PencilRadialPalette(frame: view.bounds, anchor: location,
                                           selectedTool: currentTool, selectedColor: currentInk,
-                                          colors: inkColors)
+                                          colors: inkColors, extraTools: PencilRadialPalette.ExtraTool.saved())
         palette.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        palette.onCustomize = { [weak self, weak palette] button in
+            guard let self, let palette, self.presentedViewController == nil else { return }
+            let chooser = PencilPaletteToolsController(selected: PencilRadialPalette.ExtraTool.saved())
+            chooser.onDone = { [weak palette] tools in
+                PencilRadialPalette.ExtraTool.save(Set(tools))
+                if palette?.superview != nil { palette?.updateExtras(tools) }
+            }
+            let navigation = UINavigationController(rootViewController: chooser)
+            navigation.modalPresentationStyle = .popover
+            navigation.preferredContentSize = chooser.preferredContentSize
+            navigation.popoverPresentationController?.sourceView = button
+            navigation.popoverPresentationController?.sourceRect = button.bounds
+            self.present(navigation, animated: true)
+        }
         palette.onAction = { [weak self] action in
             guard let self else { return }
             let shown = self.radialPalette
@@ -2248,14 +2262,15 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
             case .highlighter: self.selectTool(2)
             case .eraser: self.selectTool(1)
             case .lasso: self.selectTool(3)
-            case .hand: break // Pencil navigation needs a separate canvas gesture; never alter saved ink.
             case .shapes:
                 let enabled = !self.shapeModeEnabled
                 self.selectTool(0)
                 self.shapeModeEnabled = enabled
                 self.refreshToolbar()
+            case .ruler: self.toolbarAction(10)
             case .addPage: self.toolbarAction(3)
             case .overview: self.toolbarAction(2)
+            case .ai: self.askAI()
             case .color(let index): self.selectInk(index)
             }
         }
