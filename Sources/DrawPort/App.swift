@@ -498,7 +498,12 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         overviewVisible = false
         bottomPaperFill?.removeFromSuperview()
         bottomPaperFill = nil
-        nativeToolPicker.setVisible(false, forFirstResponder: canvas)
+        if #available(iOS 26.0, *) {
+            canvas.pencilKitResponderState.toolPickerVisibility = .inactive
+            canvas.pencilKitResponderState.activeToolPicker = nil
+        } else {
+            nativeToolPicker.setVisible(false, forFirstResponder: canvas)
+        }
         nativeToolPicker.removeObserver(canvas)
         nativeToolPicker.removeObserver(self)
         canvas.resignFirstResponder()
@@ -1655,16 +1660,21 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         vertical([drawingHeader(book: book, page: page), workArea])
         if keepOverview { displayOverviewPanel() }
         updateBottomSafeAreaChrome()
-        // iPadOS 18 diagnostic: the native picker has an Auto-minimize option
-        // in its own … menu. Keep it registered only when the user explicitly
-        // enables the session-only trial; the two programmatic-hide trials failed.
+        // iPadOS 26 adds a distinct active-but-offscreen picker state. On 18,
+        // programmatic hiding only gives Undo/Redo; the opt-in Auto-minimize
+        // diagnostic exposes the native arc but leaves a small system control.
         nativeToolPicker.overrideUserInterfaceStyle = .dark
         nativeToolPicker.colorUserInterfaceStyle = .light
         nativeToolPicker.showsDrawingPolicyControls = false
         nativeToolPicker.stateAutosaveName = "DrawPort.NativePickerMinimizeTrial"
         nativeToolPicker.addObserver(canvas)
         nativeToolPicker.addObserver(self)
-        nativeToolPicker.setVisible(nativePickerMinimizeTrial, forFirstResponder: canvas)
+        if #available(iOS 26.0, *) {
+            canvas.pencilKitResponderState.activeToolPicker = nativeToolPicker
+            canvas.pencilKitResponderState.toolPickerVisibility = nativePickerMinimizeTrial ? .visible : .hidden
+        } else {
+            nativeToolPicker.setVisible(nativePickerMinimizeTrial, forFirstResponder: canvas)
+        }
         canvas.becomeFirstResponder()
         syncNativeToolSelection()
         applyTool()
