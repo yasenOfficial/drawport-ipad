@@ -300,8 +300,9 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
     private var inkColors: [UIColor] = [.black, .systemBlue, .systemGreen, .systemOrange, .systemYellow, .systemRed, UIColor(red: 0, green: 0.2, blue: 0.8, alpha: 1), QuestionInk.color]
     private var colorSwatches: [Int: UIView] = [:]
     private var editingColorIndex: Int?
-    // Trial the scene-shared Apple picker; standalone hidden pickers only showed Undo/Redo.
-    private var nativeToolPicker = PKToolPicker()
+    private let nativeToolPicker = PKToolPicker()
+    // Explicit, session-only diagnostic: never leave the native dock enabled by default.
+    private var nativePickerMinimizeTrial = false
     private var syncingNativeToolPicker = false
     private var eraserByPixel = UserDefaults.standard.bool(forKey: "eraserByPixel")
     private var shapeModeEnabled = false
@@ -1414,6 +1415,27 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         let setting = UIStackView(arrangedSubviews: [orientationLabel, orientationPicker, label, picker, paletteRow])
         setting.axis = .vertical
         setting.spacing = 12
+        let trialLabel = UILabel()
+        trialLabel.text = "Native picker auto-minimize trial (this session only)"
+        trialLabel.font = .preferredFont(forTextStyle: .body)
+        trialLabel.numberOfLines = 0
+        let trialSwitch = UISwitch()
+        trialSwitch.accessibilityIdentifier = "nativePickerMinimizeTrial"
+        trialSwitch.isOn = nativePickerMinimizeTrial
+        trialSwitch.addAction(UIAction { [weak self, weak trialSwitch] _ in
+            guard let self, let trialSwitch else { return }
+            self.nativePickerMinimizeTrial = trialSwitch.isOn
+        }, for: .valueChanged)
+        let trialRow = UIStackView(arrangedSubviews: [trialLabel, trialSwitch])
+        trialRow.axis = .horizontal
+        trialRow.spacing = 12
+        setting.addArrangedSubview(trialRow)
+        let trialHelp = UILabel()
+        trialHelp.text = "On a page, open the Apple picker’s … menu and try Auto-minimize. Turn this off here if it leaves an unwanted control. This is a test, not the final squeeze UI."
+        trialHelp.font = .preferredFont(forTextStyle: .footnote)
+        trialHelp.textColor = .lightGray
+        trialHelp.numberOfLines = 0
+        setting.addArrangedSubview(trialHelp)
         for (name, key) in [
             ("Notebook tabs", "showNotebookTabs"),
             ("Page overview shortcut", "showOverviewShortcut"),
@@ -1633,26 +1655,19 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         vertical([drawingHeader(book: book, page: page), workArea])
         if keepOverview { displayOverviewPanel() }
         updateBottomSafeAreaChrome()
-        // Experiment 2: the scene-shared picker may be recognized differently
-        // from our standalone picker by iPadOS's native squeeze handling.
-        // It is activated briefly, then hidden; no custom squeeze UI is installed.
-        if let window = view.window, let shared = PKToolPicker.shared(for: window) {
-            nativeToolPicker = shared
-        }
+        // iPadOS 18 diagnostic: the native picker has an Auto-minimize option
+        // in its own … menu. Keep it registered only when the user explicitly
+        // enables the session-only trial; the two programmatic-hide trials failed.
         nativeToolPicker.overrideUserInterfaceStyle = .dark
         nativeToolPicker.colorUserInterfaceStyle = .light
         nativeToolPicker.showsDrawingPolicyControls = false
+        nativeToolPicker.stateAutosaveName = "DrawPort.NativePickerMinimizeTrial"
         nativeToolPicker.addObserver(canvas)
         nativeToolPicker.addObserver(self)
-        nativeToolPicker.setVisible(true, forFirstResponder: canvas)
+        nativeToolPicker.setVisible(nativePickerMinimizeTrial, forFirstResponder: canvas)
         canvas.becomeFirstResponder()
         syncNativeToolSelection()
         applyTool()
-        let openedPage = page.id
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            guard let self, self.pageID == openedPage, self.pageViewport != nil else { return }
-            self.nativeToolPicker.setVisible(false, forFirstResponder: self.canvas)
-        }
     }
 
     private func endSelectionKeyboardEditing() {
