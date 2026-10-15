@@ -300,8 +300,8 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
     private var inkColors: [UIColor] = [.black, .systemBlue, .systemGreen, .systemOrange, .systemYellow, .systemRed, UIColor(red: 0, green: 0.2, blue: 0.8, alpha: 1), QuestionInk.color]
     private var colorSwatches: [Int: UIView] = [:]
     private var editingColorIndex: Int?
-    // Use Apple's picker only. It is never registered as a visible/docked toolbar.
-    private let nativeToolPicker = PKToolPicker()
+    // Trial the scene-shared Apple picker; standalone hidden pickers only showed Undo/Redo.
+    private var nativeToolPicker = PKToolPicker()
     private var syncingNativeToolPicker = false
     private var eraserByPixel = UserDefaults.standard.bool(forKey: "eraserByPixel")
     private var shapeModeEnabled = false
@@ -1633,10 +1633,12 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         vertical([drawingHeader(book: book, page: page), workArea])
         if keepOverview { displayOverviewPanel() }
         updateBottomSafeAreaChrome()
-        // Experiment: briefly activate Apple's picker, then hide it. On iPadOS
-        // 18 the never-activated hidden picker only yielded system Undo/Redo.
-        // No custom squeeze handler/UI is installed. Real Pencil testing will
-        // tell us whether the system retains its native tool arc after hiding.
+        // Experiment 2: the scene-shared picker may be recognized differently
+        // from our standalone picker by iPadOS's native squeeze handling.
+        // It is activated briefly, then hidden; no custom squeeze UI is installed.
+        if let window = view.window, let shared = PKToolPicker.shared(for: window) {
+            nativeToolPicker = shared
+        }
         nativeToolPicker.overrideUserInterfaceStyle = .dark
         nativeToolPicker.colorUserInterfaceStyle = .light
         nativeToolPicker.showsDrawingPolicyControls = false
