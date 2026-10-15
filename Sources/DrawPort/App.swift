@@ -156,8 +156,8 @@ final class PageViewport: UIView {
     override init(frame: CGRect) {
         super.init(frame: frame)
         clipsToBounds = true
-        backgroundColor = UIColor(white: 0.96, alpha: 1)
-        surface.backgroundColor = .white
+        backgroundColor = UIColor(white: 0.105, alpha: 1)
+        surface.backgroundColor = UIColor(red: 1, green: 0.995, blue: 0.956, alpha: 1)
         addSubview(surface)
     }
 
@@ -205,7 +205,7 @@ final class PaperView: UIView {
 
     override init(frame: CGRect) {
         super.init(frame: frame)
-        backgroundColor = .white
+        backgroundColor = UIColor(red: 1, green: 0.995, blue: 0.956, alpha: 1)
         isOpaque = true
         contentMode = .redraw
     }
@@ -225,12 +225,12 @@ enum PaperDrawing {
     static func draw(context ctx: CGContext, size: CGSize, pattern: Int) {
         // All paper is blank in this port, including previews and exports.
         // Preserve the old `Page.background` field for lossless document decoding.
-        ctx.setFillColor(UIColor.white.cgColor)
+        ctx.setFillColor(UIColor(red: 1, green: 0.995, blue: 0.956, alpha: 1).cgColor)
         ctx.fill(CGRect(origin: .zero, size: size))
     }
 }
 
-final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInteractionDelegate, UIColorPickerViewControllerDelegate {
+final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInteractionDelegate, UIColorPickerViewControllerDelegate, UIGestureRecognizerDelegate, UIEditMenuInteractionDelegate {
     private let store: Store
     private let injectedAIClient: AIClient?
     private let injectedSyncClient: SyncClient?
@@ -276,6 +276,9 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
     private var bookID: UUID?
     private var pageID: UUID?
     private weak var overviewScroll: UIScrollView?
+    private weak var pageArea: UIStackView?
+    private weak var overviewPanel: UIView?
+    private var overviewVisible = false
     private var selectedPage: UUID?
     private var deletedMode = false
     private let paper = PaperView()
@@ -297,6 +300,18 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
     private var squeezePalette: UIView?
     private var eraserByPixel = UserDefaults.standard.bool(forKey: "eraserByPixel")
     private var shapeModeEnabled = false
+    private var shapeStartStrokeCount = 0
+    private var shapeFinalizeWork: DispatchWorkItem?
+    private var shapeCandidatePage: UUID?
+    private var lastProcessedShape: Date?
+    private var heldShapeCandidate = false
+    private var selectedStrokeIndex: Int?
+    private var selectedStrokePage: UUID?
+    private var selectionOutline: CAShapeLayer?
+    private var editingStrokeColorIndex: Int?
+    private weak var strokeTapRecognizer: UITapGestureRecognizer?
+    private weak var resizeRecognizer: UIPanGestureRecognizer?
+    private var resizeStart: (index: Int, stroke: PKStroke, anchor: CGPoint, corner: CGPoint)?
     private var carryOverlay: CarryTapOverlay?
     private var quickArmed = false
     private var quickEraserQueued = false
@@ -336,12 +351,15 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        view.backgroundColor = .white
+        overrideUserInterfaceStyle = .dark
+        view.backgroundColor = UIColor(white: 0.105, alpha: 1)
         if let saved = UserDefaults.standard.array(forKey: "customInkColors") as? [[Double]], saved.count == inkColors.count {
-            for (index, components) in saved.enumerated() where components.count == 3 && components.allSatisfy({ (0...1).contains($0) }) {
+            for (index, components) in saved.enumerated() where index != 7 && components.count == 3 && components.allSatisfy({ (0...1).contains($0) }) {
                 inkColors[index] = UIColor(red: components[0], green: components[1], blue: components[2], alpha: 1)
             }
         }
+        // Purple is semantic question/context ink, not an editable cosmetic slot.
+        inkColors[7] = QuestionInk.color
         do { aiJournal = try injectedAIJournal ?? AINetworkJournal() }
         catch { DispatchQueue.main.async { self.failure(error) } }
         canvas.backgroundColor = .clear
@@ -356,6 +374,25 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         canvas.isScrollEnabled = false
         canvas.delegate = self
         canvas.addInteraction(UIPencilInteraction(delegate: self))
+        let shapeHold = PencilShapeHold(target: nil, action: nil)
+        shapeHold.delegate = self
+        shapeHold.onHold = { [weak self] in
+            guard let self, self.usingTool, self.currentTool == 0, !self.quickArmed,
+                  self.pageViewport != nil else { return }
+            self.heldShapeCandidate = true
+        }
+        shapeHold.onMoveAfterHold = { [weak self] in self?.heldShapeCandidate = false }
+        canvas.addGestureRecognizer(shapeHold)
+        let strokeTap = UITapGestureRecognizer(target: self, action: #selector(selectStrokeAtTap(_:)))
+        strokeTap.cancelsTouchesInView = false
+        strokeTap.delegate = self
+        canvas.addGestureRecognizer(strokeTap)
+        strokeTapRecognizer = strokeTap
+        let resize = UIPanGestureRecognizer(target: self, action: #selector(resizeUsingHandle(_:)))
+        resize.delegate = self
+        canvas.addGestureRecognizer(resize)
+        resizeRecognizer = resize
+        canvas.addInteraction(UIEditMenuInteraction(delegate: self))
         canvas.minimumZoomScale = 1
         canvas.maximumZoomScale = 1
         syncStatus.heightAnchor.constraint(equalToConstant: 36).isActive = true
@@ -405,6 +442,18 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         for observer in keyboardObservers { NotificationCenter.default.removeObserver(observer) }
     }
 
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+        gestureRecognizer is PencilShapeHold || gestureRecognizer === strokeTapRecognizer
+    }
+
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        guard gestureRecognizer === resizeRecognizer else { return true }
+        guard currentTool == 3, let stroke = selectedStroke() else { return false }
+        let location = gestureRecognizer.location(in: canvas)
+        return stroke.renderBounds.insetBy(dx: -9, dy: -9).corners.contains { hypot($0.x - location.x, $0.y - location.y) < 24 }
+    }
+
     override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
         DocumentOrientation.saved().supportedInterfaceOrientations
     }
@@ -432,6 +481,14 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
     }
 
     private func clear() {
+        shapeFinalizeWork?.cancel()
+        shapeFinalizeWork = nil
+        shapeCandidatePage = nil
+        heldShapeCandidate = false
+        clearStrokeSelection()
+        pageArea = nil
+        overviewPanel = nil
+        overviewVisible = false
         squeezePalette?.removeFromSuperview()
         squeezePalette = nil
         cancelCarry()
@@ -461,7 +518,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
     private func button(_ symbol: String, label: String, action: @escaping () -> Void) -> UIButton {
         let b = UIButton(type: .system)
         b.setImage(UIImage(systemName: symbol), for: .normal)
-        b.tintColor = .black
+        b.tintColor = UIColor(white: 0.96, alpha: 1)
         b.accessibilityLabel = label
         b.addAction(UIAction { _ in action() }, for: .touchUpInside)
         b.adjustsImageSizeForAccessibilityContentSizeCategory = false
@@ -538,7 +595,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
             let count = store.notebooks.filter { $0.folderID == folder.id }.count
             b.setTitle("  \(folder.name)    ·    \(count) document\(count == 1 ? "" : "s")", for: .normal)
             b.titleLabel?.font = .preferredFont(forTextStyle: .title3)
-            b.tintColor = .black
+            b.tintColor = UIColor(white: 0.96, alpha: 1)
             b.accessibilityLabel = "Open folder \(folder.name)"
             b.heightAnchor.constraint(equalToConstant: 58).isActive = true
             b.addAction(UIAction { [weak self] _ in self?.homeFolderID = folder.id; self?.showHome() }, for: .touchUpInside)
@@ -580,7 +637,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
             b.isEnabled = DocumentOrientation.saved().fits(book.orientation)
             if !b.isEnabled { b.accessibilityHint = "Choose \(orientation.title) in Settings to open" }
             b.titleLabel?.font = .preferredFont(forTextStyle: .title3)
-            b.tintColor = .black
+            b.tintColor = UIColor(white: 0.96, alpha: 1)
             b.addAction(UIAction { [weak self] _ in
                 guard let self, DocumentOrientation.saved().fits(book.orientation) else { return }
                 self.bookID = book.id
@@ -973,6 +1030,15 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
     }
 
     private func askAI() {
+        let endpoint = DrawEndpoints.configured("ai")
+        if endpoint.host?.hasSuffix(".example.invalid") == true || DrawEndpoints.token.isEmpty {
+            let alert = UIAlertController(title: "AI suggestions need a server",
+                message: "The original Draw AI workflow and purple context ink are available, but this port has no configured AI service. No page or private note was uploaded.",
+                preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "OK", style: .default))
+            present(alert, animated: true)
+            return
+        }
         guard let id = bookID, let focus = pageID, !busyDocuments.contains(id), let journal = aiJournal else { return }
         let generation = foregroundGeneration
         busyDocuments.insert(id)
@@ -1314,11 +1380,11 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         setting.axis = .vertical
         setting.spacing = 12
         for (name, key) in [
-            ("Notebook tabs", "showNotebookTabs"), ("Numbered page tabs", "showPageTabs"),
-            ("All pages shortcut", "showOverviewShortcut"), ("New page shortcut", "showNewPageShortcut"),
+            ("Notebook tabs", "showNotebookTabs"),
+            ("Page overview shortcut", "showOverviewShortcut"),
             ("Selection tool", "showSelectionControl"), ("Ruler", "showRulerControl"),
             ("Stroke size controls", "showSizeControls"), ("Carry to next page", "showCarryControl"),
-            ("Shapes tool", "showShapesControl")
+            ("Shapes tool", "showShapesControl"), ("AI suggestions", "showAIControl")
         ] {
             let caption = UILabel()
             caption.text = name
@@ -1409,11 +1475,13 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
             for (title, active, action) in values {
                 let tab = UIButton(type: .system)
                 tab.setTitle(title, for: .normal)
-                tab.setTitleColor(active ? .white : .label, for: .normal)
-                tab.backgroundColor = active ? .systemBlue : .secondarySystemBackground
+                var configuration = UIButton.Configuration.plain()
+                configuration.contentInsets = NSDirectionalEdgeInsets(top: 8, leading: 14, bottom: 8, trailing: 14)
+                configuration.baseForegroundColor = active ? .white : UIColor(white: 0.82, alpha: 1)
+                tab.configuration = configuration
+                tab.backgroundColor = active ? UIColor(white: 0.25, alpha: 1) : .clear
                 tab.layer.cornerRadius = 9
-                tab.titleLabel?.font = .systemFont(ofSize: 14, weight: active ? .semibold : .regular)
-                tab.contentEdgeInsets = UIEdgeInsets(top: 7, left: 12, bottom: 7, right: 12)
+                tab.titleLabel?.font = .systemFont(ofSize: 15, weight: active ? .semibold : .regular)
                 tab.addAction(UIAction { _ in action() }, for: .touchUpInside)
                 strip.addArrangedSubview(tab)
             }
@@ -1430,7 +1498,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
             ])
             return scroll
         }
-        let home = button("house", label: "Notebooks") { [weak self] in
+        let home = button("chevron.left", label: "Notebooks") { [weak self] in
             self?.finishSave()
             self?.showHome()
         }
@@ -1444,29 +1512,26 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         })
         notebooks.accessibilityIdentifier = "notebookTabs"
         notebooks.isHidden = !controlVisible("showNotebookTabs")
-        let pages = tabs(book.pages.enumerated().map { index, entry in
-            ("\(index + 1)", entry.id == page.id, { [weak self] in
-                guard let self, entry.id != self.pageID else { return }
-                self.finishSave()
-                self.openPage(entry.id)
-            })
-        })
-        pages.accessibilityIdentifier = "numberedPageTabs"
-        pages.isHidden = !controlVisible("showPageTabs")
-        let add = button("plus", label: "New page") { [weak self] in self?.toolbarAction(3) }
-        let overview = button("square.grid.2x2", label: "All numbered pages") { [weak self] in self?.toolbarAction(2) }
-        add.isHidden = !controlVisible("showNewPageShortcut")
+        let overview = button("rectangle.split.2x1", label: "Page overview sidebar") { [weak self] in self?.toolbarAction(2) }
         overview.isHidden = !controlVisible("showOverviewShortcut")
-        let header = UIStackView(arrangedSubviews: [home, notebooks, pages, add, overview])
+        let more = button("ellipsis", label: "Notebook options") {}
+        more.menu = UIMenu(children: [
+            UIAction(title: "New page", image: UIImage(systemName: "plus")) { [weak self] _ in self?.toolbarAction(3) },
+            UIAction(title: "Settings", image: UIImage(systemName: "gearshape")) { [weak self] _ in
+                self?.finishSave()
+                self?.showSettings()
+            }
+        ])
+        more.showsMenuAsPrimaryAction = true
+        let header = UIStackView(arrangedSubviews: [home, notebooks, overview, more])
         header.axis = .horizontal
         header.alignment = .fill
         header.spacing = 4
-        header.backgroundColor = UIColor.secondarySystemBackground
-        header.heightAnchor.constraint(equalToConstant: 48).isActive = true
-        home.widthAnchor.constraint(equalToConstant: 44).isActive = true
-        if !add.isHidden { add.widthAnchor.constraint(equalToConstant: 44).isActive = true }
-        if !overview.isHidden { overview.widthAnchor.constraint(equalToConstant: 44).isActive = true }
-        if !notebooks.isHidden { notebooks.widthAnchor.constraint(equalTo: header.widthAnchor, multiplier: 0.44).isActive = true }
+        header.backgroundColor = UIColor(white: 0.105, alpha: 1)
+        header.heightAnchor.constraint(equalToConstant: 52).isActive = true
+        home.widthAnchor.constraint(equalToConstant: 46).isActive = true
+        more.widthAnchor.constraint(equalToConstant: 46).isActive = true
+        if !overview.isHidden { overview.widthAnchor.constraint(equalToConstant: 46).isActive = true }
         return header
     }
 
@@ -1478,6 +1543,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         pageID = page.id
         documentOpened(bookID)
         if book.currentPage != page.id { mutate { try store.update(bookID) { $0.currentPage = page.id } } }
+        let keepOverview = overviewVisible
         clear()
         let work = PageViewport()
         work.accessibilityIdentifier = "pageViewport"
@@ -1510,9 +1576,13 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         applyTool()
         let position = ToolbarPosition.saved()
         let bar = drawingToolbar(position: position)
-        let workArea = UIStackView(arrangedSubviews: position.comesFirst ? [bar, work] : [work, bar])
+        let pagesAndCanvas = UIStackView(arrangedSubviews: [work])
+        pagesAndCanvas.axis = .horizontal
+        pageArea = pagesAndCanvas
+        let workArea = UIStackView(arrangedSubviews: position.comesFirst ? [bar, pagesAndCanvas] : [pagesAndCanvas, bar])
         workArea.axis = position.isVertical ? .horizontal : .vertical
         vertical([drawingHeader(book: book, page: page), workArea])
+        if keepOverview { displayOverviewPanel() }
     }
 
     private func endSelectionKeyboardEditing() {
@@ -1579,6 +1649,10 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         cancelCarry()
         currentTool = tool
         shapeModeEnabled = false
+        shapeFinalizeWork?.cancel()
+        shapeCandidatePage = nil
+        heldShapeCandidate = false
+        clearStrokeSelection()
         UserDefaults.standard.set(tool, forKey: "tool")
         if tool == 0 || tool == 2 {
             lastInkTool = tool
@@ -1636,23 +1710,49 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
             refreshToolbar()
             return
         }
+        let keepShapes = shapeModeEnabled && lastInkTool == 0
         selectTool(lastInkTool)
+        if keepShapes { shapeModeEnabled = true; refreshToolbar() }
     }
 
     @objc private func configureInkColor(_ gesture: UILongPressGestureRecognizer) {
         guard gesture.state == .began, let button = gesture.view as? UIButton,
               inkColors.indices.contains(button.tag), presentedViewController == nil else { return }
-        editingColorIndex = button.tag
-        let picker = UIColorPickerViewController()
-        picker.supportsAlpha = false
-        picker.selectedColor = inkColors[button.tag]
-        picker.delegate = self
+        if button.tag == 7 {
+            let alert = UIAlertController(title: "Context ink", message: "Purple marks questions and context for AI suggestions. Its exact shade must stay fixed so the ink remains recognizable.", preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "OK", style: .default))
+            present(alert, animated: true)
+            return
+        }
+        let index = button.tag
+        editingColorIndex = index
+        let picker = InkPaletteController(color: inkColors[index],
+            favorites: [inkColors[0], inkColors[5], inkColors[2], inkColors[6]]) { [weak self] color in
+            self?.updateInkColor(index: index, color: color)
+        }
+        picker.onWidth = { [weak self] width in
+            guard let self else { return }
+            self.widthIndex = self.widths.indices.min(by: { abs(self.widths[$0] - width) < abs(self.widths[$1] - width) }) ?? self.widthIndex
+            self.applyTool()
+            self.refreshToolbar()
+        }
+        picker.popoverPresentationController?.sourceView = button
+        picker.popoverPresentationController?.sourceRect = button.bounds
+        picker.popoverPresentationController?.permittedArrowDirections = [.left, .right]
         present(picker, animated: true)
     }
 
     func colorPickerViewControllerDidSelectColor(_ viewController: UIColorPickerViewController) {
-        guard let index = editingColorIndex, inkColors.indices.contains(index) else { return }
-        let color = viewController.selectedColor.resolvedColor(with: traitCollection)
+        if let index = editingStrokeColorIndex {
+            recolorSelectedStroke(at: index, color: viewController.selectedColor)
+        } else if let index = editingColorIndex {
+            updateInkColor(index: index, color: viewController.selectedColor)
+        }
+    }
+
+    private func updateInkColor(index: Int, color rawColor: UIColor) {
+        guard inkColors.indices.contains(index), index != 7 else { return }
+        let color = rawColor.resolvedColor(with: traitCollection)
         var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
         guard color.getRed(&r, green: &g, blue: &b, alpha: &a) else { return }
         inkColors[index] = UIColor(red: r, green: g, blue: b, alpha: 1)
@@ -1663,7 +1763,8 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
             return [Double(red), Double(green), Double(blue)]
         }
         UserDefaults.standard.set(saved, forKey: "customInkColors")
-        if currentInk == index { applyTool() }
+        if currentInk != index { selectInk(index) }
+        else { applyTool(); refreshToolbar() }
     }
 
     @objc private func configureEraser(_ gesture: UILongPressGestureRecognizer) {
@@ -1706,7 +1807,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
             let action = i >= 6 ? i + 1 : i // Keep action IDs stable after removing the persistent eraser.
             let b = button(symbols[i], label: names[i]) { [weak self] in self?.toolbarAction(action) }
             // Page navigation and paper templates live outside the pen strip.
-            if i <= 4 { b.isHidden = true }
+            if i <= 4 && i != 2 { b.isHidden = true }
             if i == 8 { b.isHidden = !controlVisible("showSelectionControl") }
             if i == 9 { b.isHidden = !controlVisible("showRulerControl") }
             if i == 10 || i == 11 { b.isHidden = !controlVisible("showSizeControls") }
@@ -1720,7 +1821,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         }
         for i in inkColors.indices {
             let b = UIButton(type: .system)
-            b.backgroundColor = .white
+            b.backgroundColor = .clear
             let swatch = UIView()
             swatch.backgroundColor = inkColors[i]
             swatch.layer.cornerRadius = 10
@@ -1737,7 +1838,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
                 let badge = UILabel()
                 badge.text = "?"
                 badge.font = .systemFont(ofSize: 15, weight: .bold)
-                badge.textColor = .white
+                badge.textColor = .black
                 badge.textAlignment = .center
                 badge.isUserInteractionEnabled = false
                 badge.translatesAutoresizingMaskIntoConstraints = false
@@ -1755,7 +1856,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
             b.addAction(UIAction { [weak self] _ in self?.colorSelection = nil }, for: [.touchCancel, .touchUpOutside])
             b.addAction(UIAction { [weak self] _ in self?.selectInk(i) }, for: .touchUpInside)
             // Initial compact palette; keep original indices and stored strokes intact.
-            if !UserDefaults.standard.bool(forKey: "showAllColors") && ![0, 2, 5, 6].contains(i) { b.isHidden = true }
+            if !UserDefaults.standard.bool(forKey: "showAllColors") && ![0, 2, 5, 6, 7].contains(i) { b.isHidden = true }
             let longPress = UILongPressGestureRecognizer(target: self, action: #selector(configureInkColor(_:)))
             longPress.minimumPressDuration = 0.45
             b.tag = i
@@ -1764,11 +1865,14 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
             controls.append(b)
             buttons.append(b)
         }
-        let ask = button("sparkles", label: "AI") { [weak self] in self?.askAI() }
+        // Present four familiar swatches plus the reserved purple context ink.
+        let originalSwatches = Array(controls[12..<(12 + inkColors.count)])
+        controls.replaceSubrange(12..<(12 + inkColors.count), with: [0, 5, 2, 6, 7, 1, 3, 4].map { originalSwatches[$0] })
+        let ask = button("sparkles", label: "AI suggestions") { [weak self] in self?.askAI() }
         ask.accessibilityIdentifier = "askAI"
         aiButton = ask
-        // Draw's reference AI endpoint is a placeholder, not a running service.
-        ask.isHidden = true
+        ask.isHidden = !controlVisible("showAIControl")
+        // Restore the upstream control, but never submit private notes to a placeholder host.
         controls.append(ask)
         buttons.append(ask)
         for (i, symbol) in ["star", "arrow.uturn.backward", "arrow.uturn.forward"].enumerated() {
@@ -1796,21 +1900,34 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         strip.axis = position.isVertical ? .vertical : .horizontal
         let base = UIView()
         base.accessibilityIdentifier = "drawingToolbar"
-        base.backgroundColor = UIColor(white: 0.96, alpha: 1)
-        base.addSubview(strip)
-        NSLayoutConstraint.activate([
-            strip.leadingAnchor.constraint(equalTo: base.leadingAnchor),
-            strip.trailingAnchor.constraint(equalTo: base.trailingAnchor),
-            strip.topAnchor.constraint(equalTo: base.topAnchor)
-        ])
+        base.backgroundColor = UIColor(white: 0.105, alpha: 1)
         if position.isVertical {
-            base.widthAnchor.constraint(equalToConstant: 44).isActive = true
-            strip.bottomAnchor.constraint(lessThanOrEqualTo: base.bottomAnchor).isActive = true
-            let height = strip.heightAnchor.constraint(equalToConstant: CGFloat(controls.filter { !$0.isHidden }.count) * 44)
-            height.priority = .defaultHigh
-            height.isActive = true
+            base.widthAnchor.constraint(equalToConstant: 46).isActive = true
+            let scroll = UIScrollView()
+            scroll.showsVerticalScrollIndicator = false
+            scroll.addSubview(strip)
+            base.addSubview(scroll)
+            scroll.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                scroll.leadingAnchor.constraint(equalTo: base.leadingAnchor),
+                scroll.trailingAnchor.constraint(equalTo: base.trailingAnchor),
+                scroll.topAnchor.constraint(equalTo: base.topAnchor),
+                scroll.bottomAnchor.constraint(equalTo: base.bottomAnchor),
+                strip.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor),
+                strip.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor),
+                strip.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
+                strip.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
+                strip.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor),
+                strip.heightAnchor.constraint(equalToConstant: CGFloat(controls.filter { !$0.isHidden }.count) * 44)
+            ])
         } else {
-            strip.bottomAnchor.constraint(equalTo: base.bottomAnchor).isActive = true
+            base.addSubview(strip)
+            NSLayoutConstraint.activate([
+                strip.leadingAnchor.constraint(equalTo: base.leadingAnchor),
+                strip.trailingAnchor.constraint(equalTo: base.trailingAnchor),
+                strip.topAnchor.constraint(equalTo: base.topAnchor),
+                strip.bottomAnchor.constraint(equalTo: base.bottomAnchor)
+            ])
         }
         refreshToolbar()
         return base
@@ -1820,26 +1937,26 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         guard buttons.count == 12 + inkColors.count + 6 else { return }
         for (i, b) in buttons.enumerated() {
             b.layer.borderWidth = 0
-            b.alpha = b.isEnabled ? 1 : 0.35
+            b.alpha = b.isEnabled ? 1 : 0.65
             let selected = !quickArmed && ((i == 5 && currentTool == 0) || (i == 7 && currentTool == 2) || (i == 8 && currentTool == 3))
                 || (i == 6 && quickArmed) || (i == 9 && canvas.isRulerActive)
                 || (i == 16 + inkColors.count && carryOverlay != nil)
                 || (i == 17 + inkColors.count && shapeModeEnabled)
             b.isSelected = selected
             if selected {
-                b.backgroundColor = UIColor(white: 0.86, alpha: 1)
+                b.backgroundColor = UIColor(white: 0.29, alpha: 1)
             } else if i < 12 || i >= 12 + inkColors.count { b.backgroundColor = .clear }
         }
         buttons[5].accessibilityValue = String(format: "%g pt", Double(widths[widthIndex]))
         buttons[6].accessibilityValue = eraserByPixel ? "Pixel" : "Whole stroke"
         buttons[13 + inkColors.count].setImage(UIImage(systemName: activePage()?.starred == true ? "star.fill" : "star"), for: .normal)
         aiButton?.isEnabled = bookID.map { !busyDocuments.contains($0) } ?? false
-        aiButton?.alpha = aiButton?.isEnabled == true ? 1 : 0.35
+        aiButton?.alpha = aiButton?.isEnabled == true ? 1 : 0.65
         for i in inkColors.indices {
             let b = buttons[12 + i]
             b.isSelected = i == currentInk
             b.layer.borderWidth = i == currentInk ? 3 : 0
-            b.layer.borderColor = UIColor.black.cgColor
+            b.layer.borderColor = UIColor.systemBlue.cgColor
             b.layer.cornerRadius = 20
         }
     }
@@ -1940,6 +2057,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
 
     private func setDrawing(_ drawing: PKDrawing) {
         saveWork?.cancel()
+        clearStrokeSelection()
         loadingDrawing = true
         // Reusing archived PKDrawing state in the live canvas can resurrect
         // removed strokes on the next contact. Rebuild from the visible strokes,
@@ -2010,15 +2128,239 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         squeezePalette = menu
     }
 
-    func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) { usingTool = true }
+    private func clearStrokeSelection() {
+        selectionOutline?.removeFromSuperlayer()
+        selectionOutline = nil
+        selectedStrokeIndex = nil
+        selectedStrokePage = nil
+        editingStrokeColorIndex = nil
+        resizeStart = nil
+    }
+
+    private func selectedStroke() -> PKStroke? {
+        guard pageID == selectedStrokePage, let selectedStrokeIndex,
+              canvas.drawing.strokes.indices.contains(selectedStrokeIndex) else { return nil }
+        return canvas.drawing.strokes[selectedStrokeIndex]
+    }
+
+    private func showSelectedStrokeOutline() {
+        selectionOutline?.removeFromSuperlayer()
+        guard let stroke = selectedStroke() else { clearStrokeSelection(); return }
+        let rect = stroke.renderBounds.insetBy(dx: -9, dy: -9)
+        guard rect.width.isFinite, rect.height.isFinite, rect.width < 10_000, rect.height < 10_000 else { return }
+        let outline = CAShapeLayer()
+        outline.path = UIBezierPath(roundedRect: rect, cornerRadius: 10).cgPath
+        outline.fillColor = UIColor.clear.cgColor
+        outline.strokeColor = UIColor.systemBlue.cgColor
+        outline.lineWidth = 2
+        outline.lineDashPattern = [6, 5]
+        for point in rect.corners {
+            let handle = CAShapeLayer()
+            handle.path = UIBezierPath(ovalIn: CGRect(x: point.x - 5, y: point.y - 5, width: 10, height: 10)).cgPath
+            handle.fillColor = UIColor.systemBlue.cgColor
+            handle.strokeColor = UIColor.white.cgColor
+            handle.lineWidth = 1.5
+            outline.addSublayer(handle)
+        }
+        canvas.layer.addSublayer(outline)
+        selectionOutline = outline
+    }
+
+    @objc private func selectStrokeAtTap(_ gesture: UITapGestureRecognizer) {
+        guard gesture.state == .ended, currentTool == 3, !usingTool, pageID != nil else { return }
+        let location = gesture.location(in: canvas)
+        var best: (index: Int, distance: CGFloat)?
+        for (index, stroke) in canvas.drawing.strokes.enumerated() {
+            guard stroke.renderBounds.insetBy(dx: -25, dy: -25).contains(location) else { continue }
+            let path = Array(stroke.path)
+            guard path.count > 1 else { continue }
+            let strideLength = max(1, path.count / 100)
+            let points = Swift.stride(from: 0, to: path.count, by: strideLength).map { path[$0].location.applying(stroke.transform) }
+            guard points.count > 1 else { continue }
+            for n in 1..<points.count {
+                let a = points[n - 1], b = points[n], dx = b.x - a.x, dy = b.y - a.y
+                let length = dx * dx + dy * dy
+                let t = length > 0 ? max(0, min(1, ((location.x - a.x) * dx + (location.y - a.y) * dy) / length)) : 0
+                let distance = hypot(location.x - a.x - t * dx, location.y - a.y - t * dy)
+                if distance < 21 && (best == nil || distance < best!.distance) { best = (index, distance) }
+            }
+        }
+        guard let best else { clearStrokeSelection(); return }
+        selectedStrokeIndex = best.index
+        selectedStrokePage = pageID
+        showSelectedStrokeOutline()
+        if let menu = canvas.interactions.first(where: { $0 is UIEditMenuInteraction }) as? UIEditMenuInteraction {
+            menu.presentEditMenu(with: UIEditMenuConfiguration(identifier: nil, sourcePoint: location))
+        }
+    }
+
+    private func imageOfSelectedStroke() -> UIImage? {
+        guard let stroke = selectedStroke() else { return nil }
+        let rect = stroke.renderBounds.insetBy(dx: -16, dy: -16)
+        guard rect.width.isFinite, rect.height.isFinite, rect.width > 0, rect.height > 0,
+              rect.width < 2000, rect.height < 2000 else { return nil }
+        return PKDrawing(strokes: [stroke]).image(from: rect, scale: 2)
+    }
+
+    private func removeSelectedStroke() {
+        guard let selectedStrokeIndex, selectedStroke() != nil else { return }
+        var strokes = canvas.drawing.strokes
+        strokes.remove(at: selectedStrokeIndex)
+        clearStrokeSelection()
+        loadingDrawing = true
+        canvas.drawing = PKDrawing(strokes: strokes)
+        loadingDrawing = false
+        scheduleSave()
+    }
+
+    private func duplicateSelectedStroke() {
+        guard let stroke = selectedStroke() else { return }
+        let copy = PKDrawing(strokes: [stroke]).transformed(using: CGAffineTransform(translationX: 22, y: 22))
+        var strokes = canvas.drawing.strokes
+        strokes.append(contentsOf: copy.strokes)
+        loadingDrawing = true
+        canvas.drawing = PKDrawing(strokes: strokes)
+        loadingDrawing = false
+        self.selectedStrokeIndex = strokes.count - 1
+        showSelectedStrokeOutline()
+        scheduleSave()
+    }
+
+    @objc private func resizeUsingHandle(_ gesture: UIPanGestureRecognizer) {
+        guard currentTool == 3, let index = selectedStrokeIndex else { return }
+        let point = gesture.location(in: canvas)
+        if gesture.state == .began {
+            guard let stroke = selectedStroke() else { return }
+            let rect = stroke.renderBounds.insetBy(dx: -9, dy: -9)
+            guard let corner = rect.corners.min(by: { hypot($0.x - point.x, $0.y - point.y) < hypot($1.x - point.x, $1.y - point.y) }) else { return }
+            let anchor = CGPoint(x: corner.x == rect.minX ? rect.maxX : rect.minX,
+                                 y: corner.y == rect.minY ? rect.maxY : rect.minY)
+            resizeStart = (index, stroke, anchor, corner)
+        } else if gesture.state == .changed, let start = resizeStart,
+                  canvas.drawing.strokes.indices.contains(start.index) {
+            let dx = start.corner.x - start.anchor.x, dy = start.corner.y - start.anchor.y
+            guard abs(dx) > 10, abs(dy) > 10 else { return }
+            let fx = abs((point.x - start.anchor.x) / dx), fy = abs((point.y - start.anchor.y) / dy)
+            let factor = max(0.25, min(4, max(fx, fy)))
+            let transform = CGAffineTransform(translationX: start.anchor.x, y: start.anchor.y)
+                .scaledBy(x: factor, y: factor).translatedBy(x: -start.anchor.x, y: -start.anchor.y)
+            guard let scaled = PKDrawing(strokes: [start.stroke]).transformed(using: transform).strokes.first else { return }
+            var strokes = canvas.drawing.strokes
+            strokes[start.index] = scaled
+            loadingDrawing = true
+            canvas.drawing = PKDrawing(strokes: strokes)
+            loadingDrawing = false
+            showSelectedStrokeOutline()
+        } else if gesture.state == .ended || gesture.state == .cancelled {
+            resizeStart = nil
+            scheduleSave()
+        }
+    }
+
+    private func resizeSelectedStroke(_ factor: CGFloat) {
+        guard let stroke = selectedStroke(), let selectedStrokeIndex else { return }
+        let center = CGPoint(x: stroke.renderBounds.midX, y: stroke.renderBounds.midY)
+        let transform = CGAffineTransform(translationX: center.x, y: center.y)
+            .scaledBy(x: factor, y: factor).translatedBy(x: -center.x, y: -center.y)
+        guard let scaled = PKDrawing(strokes: [stroke]).transformed(using: transform).strokes.first else { return }
+        var strokes = canvas.drawing.strokes
+        strokes[selectedStrokeIndex] = scaled
+        loadingDrawing = true
+        canvas.drawing = PKDrawing(strokes: strokes)
+        loadingDrawing = false
+        showSelectedStrokeOutline()
+        scheduleSave()
+    }
+
+    private func recolorSelectedStroke(at index: Int, color: UIColor) {
+        guard selectedStrokeIndex == index, let stroke = selectedStroke() else { return }
+        let recolored = PKStroke(ink: PKInk(stroke.ink.inkType, color: color), path: stroke.path,
+            transform: stroke.transform, mask: stroke.mask, randomSeed: stroke.randomSeed)
+        var strokes = canvas.drawing.strokes
+        strokes[index] = recolored
+        loadingDrawing = true
+        canvas.drawing = PKDrawing(strokes: strokes)
+        loadingDrawing = false
+        showSelectedStrokeOutline()
+        scheduleSave()
+    }
+
+    func editMenuInteraction(_ interaction: UIEditMenuInteraction, menuFor configuration: UIEditMenuConfiguration,
+                             suggestedActions: [UIMenuElement]) -> UIMenu? {
+        guard selectedStroke() != nil, currentTool == 3 else { return nil }
+        return UIMenu(children: [
+            UIAction(title: "Cut", image: UIImage(systemName: "scissors")) { [weak self] _ in
+                guard let self, let image = self.imageOfSelectedStroke() else { return }
+                UIPasteboard.general.image = image
+                self.removeSelectedStroke()
+            },
+            UIAction(title: "Copy", image: UIImage(systemName: "doc.on.doc")) { [weak self] _ in
+                if let image = self?.imageOfSelectedStroke() { UIPasteboard.general.image = image }
+            },
+            UIAction(title: "Duplicate", image: UIImage(systemName: "plus.square.on.square")) { [weak self] _ in self?.duplicateSelectedStroke() },
+            UIAction(title: "Delete", image: UIImage(systemName: "trash"), attributes: .destructive) { [weak self] _ in self?.removeSelectedStroke() },
+            UIMenu(title: "Resize", image: UIImage(systemName: "arrow.up.left.and.arrow.down.right"), children: [
+                UIAction(title: "Smaller") { [weak self] _ in self?.resizeSelectedStroke(0.85) },
+                UIAction(title: "Larger") { [weak self] _ in self?.resizeSelectedStroke(1.15) }
+            ]),
+            UIAction(title: "Style", image: UIImage(systemName: "paintpalette")) { [weak self] _ in
+                guard let self, let index = self.selectedStrokeIndex, let stroke = self.selectedStroke() else { return }
+                self.editingColorIndex = nil
+                self.editingStrokeColorIndex = index
+                let picker = UIColorPickerViewController()
+                picker.overrideUserInterfaceStyle = .dark
+                picker.selectedColor = stroke.ink.color
+                picker.supportsAlpha = false
+                picker.delegate = self
+                self.present(picker, animated: true)
+            },
+            UIAction(title: "Take Screenshot", image: UIImage(systemName: "camera")) { [weak self] _ in
+                guard let self, let image = self.imageOfSelectedStroke() else { return }
+                let share = UIActivityViewController(activityItems: [image], applicationActivities: nil)
+                share.popoverPresentationController?.sourceView = self.canvas
+                share.popoverPresentationController?.sourceRect = self.selectedStroke()?.renderBounds ?? .zero
+                self.present(share, animated: true)
+            }
+        ])
+    }
+
+    func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) {
+        usingTool = true
+        shapeFinalizeWork?.cancel()
+        shapeStartStrokeCount = canvas.drawing.strokes.count
+        shapeCandidatePage = pageID
+        heldShapeCandidate = false
+        lastProcessedShape = nil
+    }
+
+    private func scheduleShapeFinalize() {
+        guard (shapeModeEnabled || heldShapeCandidate), currentTool == 0, !quickArmed, !usingTool,
+              shapeCandidatePage == pageID, pageViewport != nil else { return }
+        shapeFinalizeWork?.cancel()
+        let startedWith = shapeStartStrokeCount
+        let page = pageID
+        let finalize = DispatchWorkItem { [weak self] in
+            guard let self, self.pageID == page, self.shapeModeEnabled || self.heldShapeCandidate,
+                  !self.usingTool, self.currentTool == 0, !self.quickArmed else { return }
+            // PencilKit may publish the final stroke AFTER didEndUsingTool.
+            let strokes = self.canvas.drawing.strokes
+            guard strokes.count > startedWith, let last = strokes.last,
+                  self.lastProcessedShape != last.path.creationDate else { return }
+            self.lastProcessedShape = last.path.creationDate
+            self.heldShapeCandidate = false
+            guard let replacement = ShapeSnap.recognized(last) else { return }
+            self.loadingDrawing = true
+            self.canvas.drawing = PKDrawing(strokes: Array(strokes.dropLast()) + [replacement])
+            self.loadingDrawing = false
+            self.scheduleSave()
+        }
+        shapeFinalizeWork = finalize
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: finalize)
+    }
+
     func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
         usingTool = false
-        if shapeModeEnabled && currentTool == 0 && !quickArmed && pageViewport != nil,
-           let last = canvas.drawing.strokes.last, let replacement = ShapeSnap.recognized(last) {
-            loadingDrawing = true
-            canvas.drawing = PKDrawing(strokes: Array(canvas.drawing.strokes.dropLast()) + [replacement])
-            loadingDrawing = false
-        }
+        scheduleShapeFinalize()
         #if DEBUG && targetEnvironment(simulator)
         keyboardDebugToolEnds += 1
         #endif
@@ -2043,7 +2385,10 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
     }
 
     func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
-        if !loadingDrawing && !usingTool && canvas.drawing != savedDrawing { scheduleSave() }
+        if !loadingDrawing && !usingTool && canvas.drawing != savedDrawing {
+            scheduleShapeFinalize()
+            scheduleSave()
+        }
     }
 
     private func scheduleSave() {
@@ -2069,17 +2414,66 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         mutate { try saveCanvasIfChanged() }
     }
 
-    // All pages in a scrollable overview: no batches of nine or hidden page numbers.
+    // Keep the active page visible while browsing page previews in a right sidebar.
     func showOverview() {
         guard let bookID, let book = store.notebook(bookID), DocumentOrientation.saved().fits(book.orientation) else { showHome(); return }
-        let previousOffset = overviewScroll?.contentOffset.y ?? 0
+        if pageArea != nil {
+            if overviewVisible { closeOverviewPanel() }
+            else { displayOverviewPanel() }
+            return
+        }
+        let offset = overviewScroll?.contentOffset.y ?? 0
         pageID = nil
         documentOpened(bookID)
         clear()
+        vertical([overviewView(book: book, offset: offset)])
+    }
+
+    private func closeOverviewPanel() {
+        overviewPanel?.removeFromSuperview()
+        overviewPanel = nil
+        overviewVisible = false
+    }
+
+    private func displayOverviewPanel() {
+        guard let pageArea, let bookID, let book = store.notebook(bookID), !overviewVisible else { return }
+        let panel = overviewView(book: book, offset: 0)
+        panel.backgroundColor = UIColor(white: 0.105, alpha: 1)
+        pageArea.addArrangedSubview(panel)
+        panel.widthAnchor.constraint(equalToConstant: max(250, min(370, view.bounds.width * 0.29))).isActive = true
+        overviewPanel = panel
+        overviewVisible = true
+    }
+
+    private func refreshOverview() {
+        guard let bookID, let book = store.notebook(bookID) else { return }
+        if let panel = overviewPanel, let pageArea {
+            let offset = overviewScroll?.contentOffset.y ?? 0
+            panel.removeFromSuperview()
+            let refreshed = overviewView(book: book, offset: offset)
+            refreshed.backgroundColor = UIColor(white: 0.105, alpha: 1)
+            pageArea.addArrangedSubview(refreshed)
+            refreshed.widthAnchor.constraint(equalToConstant: max(250, min(370, view.bounds.width * 0.29))).isActive = true
+            overviewPanel = refreshed
+        } else { showOverview() }
+    }
+
+    private func overviewView(book: Notebook, offset previousOffset: CGFloat) -> UIView {
+        let bookID = book.id
         let pages = deletedMode ? book.deleted : book.pages
-        let home = button("chevron.left", label: "Documents") { [weak self] in self?.deletedMode = false; self?.showHome() }
+        let home = button(pageArea == nil ? "chevron.left" : "ellipsis", label: "Overview options") { [weak self] in
+            guard let self else { return }
+            if self.pageArea == nil { self.deletedMode = false; self.showHome() }
+        }
+        if pageArea != nil {
+            home.menu = UIMenu(children: [
+                UIAction(title: "Close overview", image: UIImage(systemName: "xmark")) { [weak self] _ in self?.closeOverviewPanel() },
+                UIAction(title: "Documents", image: UIImage(systemName: "house")) { [weak self] _ in self?.finishSave(); self?.showHome() }
+            ])
+            home.showsMenuAsPrimaryAction = true
+        }
         let deleted = button(deletedMode ? "square.grid.2x2" : "trash", label: deletedMode ? "Pages" : "Deleted pages") { [weak self] in
-            self?.deletedMode.toggle(); self?.selectedPage = nil; self?.overviewScroll = nil; self?.showOverview()
+            self?.deletedMode.toggle(); self?.selectedPage = nil; self?.overviewScroll = nil; self?.refreshOverview()
         }
         let add = button("plus", label: "New page") { [weak self] in
             guard let self, let bookID = self.bookID, self.store.notebook(bookID) != nil, !self.deletedMode else { return }
@@ -2091,27 +2485,37 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         let title = UILabel()
         title.textAlignment = .center
         title.font = .preferredFont(forTextStyle: .headline)
-        title.text = deletedMode ? "Deleted pages (\(pages.count))" : "\(book.name) • \(pages.count) pages"
+        title.text = deletedMode ? "Deleted (\(pages.count))" : pageArea == nil ? "\(book.name) • \(pages.count) pages" : "Overview"
+        title.textColor = .white
         let header = UIStackView(arrangedSubviews: [home, title, add, deleted])
         header.axis = .horizontal
         header.heightAnchor.constraint(equalToConstant: 48).isActive = true
         for control in [home, deleted] { control.widthAnchor.constraint(equalToConstant: 50).isActive = true }
         if !deletedMode { add.widthAnchor.constraint(equalToConstant: 50).isActive = true }
+        let modes = UISegmentedControl(items: [UIImage(systemName: "square.grid.2x2")!, UIImage(systemName: "list.bullet")!])
+        modes.selectedSegmentIndex = UserDefaults.standard.bool(forKey: "overviewListMode") ? 1 : 0
+        modes.addAction(UIAction { [weak self] _ in
+            UserDefaults.standard.set(modes.selectedSegmentIndex == 1, forKey: "overviewListMode")
+            self?.refreshOverview()
+        }, for: .valueChanged)
+        modes.heightAnchor.constraint(equalToConstant: 36).isActive = true
+        let listMode = modes.selectedSegmentIndex == 1
+        let columns = listMode ? 1 : pageArea == nil ? 3 : 2
         let grid = UIStackView()
         grid.accessibilityIdentifier = "pageOverviewGrid"
         grid.axis = .vertical
         grid.distribution = .fill
         grid.spacing = 8
-        grid.backgroundColor = UIColor(white: 0.96, alpha: 1)
-        for r in 0..<max(1, (pages.count + 2) / 3) {
+        grid.backgroundColor = UIColor(white: 0.15, alpha: 1)
+        for r in 0..<max(1, (pages.count + columns - 1) / columns) {
             var cells: [UIView] = []
-            for c in 0..<3 {
-                let n = r * 3 + c
+            for c in 0..<columns {
+                let n = r * columns + c
                 guard n < pages.count else { cells.append(UIView()); continue }
                 let page = pages[n]
                 let cell = UIButton(type: .custom)
-                cell.backgroundColor = .white
-                cell.layer.borderWidth = page.id == selectedPage ? 3 : 0
+                cell.backgroundColor = UIColor(red: 1, green: 0.995, blue: 0.956, alpha: 1)
+                cell.layer.borderWidth = page.id == (selectedPage ?? pageID) ? 3 : 0
                 cell.layer.borderColor = UIColor.systemBlue.cgColor
                 cell.accessibilityLabel = "Page \(n + 1)"
                 if let drawing = try? store.drawing(book: bookID, page: page) {
@@ -2124,7 +2528,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
                 cell.imageView?.contentMode = .scaleAspectFit
                 cell.addAction(UIAction { [weak self] _ in
                     guard let self else { return }
-                    if self.deletedMode { self.selectedPage = page.id; self.showOverview() }
+                    if self.deletedMode { self.selectedPage = page.id; self.refreshOverview() }
                     else { self.openPage(page.id) }
                 }, for: .touchUpInside)
                 let hold = UILongPressGestureRecognizer(target: self, action: #selector(selectPage(_:)))
@@ -2132,7 +2536,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
                 cell.accessibilityIdentifier = page.id.uuidString
                 cell.addGestureRecognizer(hold)
                 let number = UILabel()
-                number.text = "Page \(n + 1)"
+                number.text = "\(n + 1) ▾"
                 number.textAlignment = .center
                 number.font = .preferredFont(forTextStyle: .footnote)
                 number.textColor = .label
@@ -2142,7 +2546,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
                 numberedCell.spacing = 2
                 cells.append(numberedCell)
             }
-            grid.addArrangedSubview(row(cells, height: 178))
+            grid.addArrangedSubview(row(cells, height: listMode ? 96 : pageArea == nil ? 178 : 208))
         }
         let scroll = UIScrollView()
         scroll.accessibilityIdentifier = "allPagesScrollView"
@@ -2169,36 +2573,42 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
             b.isEnabled = selectedPage != nil
             return b
         }, height: 48)
-        vertical([header, scroll, footer])
+        let panel = UIStackView(arrangedSubviews: selectedPage == nil ? [header, modes, scroll] : [header, modes, scroll, footer])
+        panel.axis = .vertical
+        panel.spacing = 8
         DispatchQueue.main.async { [weak scroll] in
             guard let scroll else { return }
             let maximum = max(0, scroll.contentSize.height - scroll.bounds.height)
             scroll.setContentOffset(CGPoint(x: 0, y: min(previousOffset, maximum)), animated: false)
         }
+        return panel
     }
 
     @objc private func selectPage(_ gesture: UILongPressGestureRecognizer) {
         guard gesture.state == .began, let string = gesture.view?.accessibilityIdentifier,
               let id = UUID(uuidString: string) else { return }
         selectedPage = id
-        showOverview()
+        refreshOverview()
     }
 
     private func duplicatePage() {
         guard let bookID, let selectedPage, let page = store.notebook(bookID)?.pages.first(where: { $0.id == selectedPage }) else { return }
+        if pageArea != nil { finishSave() }
         mutate { try store.duplicate(book: bookID, page: page) }
-        showOverview()
+        refreshOverview()
     }
 
     private func deletePage() {
         guard let bookID, let selectedPage else { return }
+        if pageArea != nil { finishSave() }
         mutate { try store.update(bookID) { book in
             guard book.pages.count > 1, let i = book.pages.firstIndex(where: { $0.id == selectedPage }) else { return }
             book.deleted.append(book.pages.remove(at: i))
             if book.currentPage == selectedPage { book.currentPage = book.pages[min(i, book.pages.count - 1)].id }
         } }
         self.selectedPage = nil
-        showOverview()
+        if pageID == selectedPage, let current = store.notebook(bookID)?.currentPage { openPage(current) }
+        else { refreshOverview() }
     }
 
     private func restorePage() {
@@ -2208,15 +2618,16 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
             book.pages.append(book.deleted.remove(at: i))
         } }
         self.selectedPage = nil
-        showOverview()
+        refreshOverview()
     }
 
     private func movePage(_ delta: Int) {
         guard let bookID, let selectedPage else { return }
+        if pageArea != nil { finishSave() }
         mutate { try store.update(bookID) { book in
             guard let i = book.pages.firstIndex(where: { $0.id == selectedPage }), book.pages.indices.contains(i + delta) else { return }
             book.pages.swapAt(i, i + delta)
         } }
-        showOverview()
+        refreshOverview()
     }
 }

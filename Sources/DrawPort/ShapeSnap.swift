@@ -60,10 +60,25 @@ enum ShapeSnap {
             if distance(start, end) > 28 && deviation < max(9, diagonal * 0.06) {
                 shapePoints = sampled([start, end], closed: false)
             } else {
-                // Smooth an intentional curve only in shape mode; never in ordinary pen mode.
-                shapePoints = points.indices.map { index in
-                    let a = points[max(0, index - 1)], b = points[index], c = points[min(index + 1, points.count - 1)]
-                    return CGPoint(x: (a.x + 2 * b.x + c.x) / 4, y: (a.y + 2 * b.y + c.y) / 4)
+                // Fit an arc through the start, midpoint and end. For an S-curve
+                // keep the original geometry and smooth gently instead.
+                let middle = points[points.count / 2]
+                let control = CGPoint(x: 2 * middle.x - (start.x + end.x) / 2,
+                                      y: 2 * middle.y - (start.y + end.y) / 2)
+                let thirds = [points[points.count / 3], points[points.count * 2 / 3]]
+                let signs = thirds.map { (end.x - start.x) * ($0.y - start.y) - (end.y - start.y) * ($0.x - start.x) }
+                let isSCurve = signs[0] * signs[1] < 0 && thirds.allSatisfy { segmentDistance($0, start, end) > diagonal * 0.07 }
+                if !isSCurve && distance(start, end) > 30 && segmentDistance(middle, start, end) > max(9, diagonal * 0.06) {
+                    shapePoints = (0...64).map { index in
+                        let t = CGFloat(index) / 64, u = 1 - t
+                        return CGPoint(x: u * u * start.x + 2 * u * t * control.x + t * t * end.x,
+                                       y: u * u * start.y + 2 * u * t * control.y + t * t * end.y)
+                    }
+                } else {
+                    shapePoints = points.indices.map { index in
+                        let a = points[max(0, index - 1)], b = points[index], c = points[min(index + 1, points.count - 1)]
+                        return CGPoint(x: (a.x + 2 * b.x + c.x) / 4, y: (a.y + 2 * b.y + c.y) / 4)
+                    }
                 }
             }
         } else {
