@@ -305,6 +305,11 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
     private var nativePickerMinimizeTrial = false
     private var squeezeActivationTrial = false
     private var squeezeTrialCallbacks = 0
+    private var squeezeTrialBegan = 0
+    private var squeezeTrialEnded = 0
+    private var squeezeTrialActivations = 0
+    private var squeezeTrialFirstResponder = false
+    private var squeezeTrialPickerVisible = false
     private lazy var squeezeInteraction: UIPencilInteraction = {
         let interaction = UIPencilInteraction(delegate: self)
         interaction.isEnabled = false
@@ -1446,7 +1451,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         setting.addArrangedSubview(trialLabel)
         setting.addArrangedSubview(trialModes)
         let trialHelp = UILabel()
-        trialHelp.text = "Auto-minimize leaves a system control in the corner. On squeeze briefly activates Apple's picker, then hides it; the lower bar may flash. Squeeze callbacks this session: \(squeezeTrialCallbacks). Both are experiments, not the final UI."
+        trialHelp.text = "Pencil setting: \(UIPencilInteraction.preferredSqueezeAction.rawValue). Callbacks: \(squeezeTrialCallbacks) (began \(squeezeTrialBegan), ended \(squeezeTrialEnded)). Activation attempts: \(squeezeTrialActivations). Canvas focused: \(squeezeTrialFirstResponder). Picker visible: \(squeezeTrialPickerVisible). On squeeze may briefly show the lower Apple bar. Auto-minimize leaves a corner control. Both are tests, not the final UI."
         trialHelp.font = .preferredFont(forTextStyle: .footnote)
         trialHelp.textColor = .lightGray
         trialHelp.numberOfLines = 0
@@ -2226,21 +2231,30 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
     func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
         guard squeezeActivationTrial, pageViewport != nil else { return }
         squeezeTrialCallbacks += 1
-        guard UIPencilInteraction.preferredSqueezeAction == .showContextualPalette else { return }
+        if squeeze.phase == .began { squeezeTrialBegan += 1 }
+        if squeeze.phase == .ended { squeezeTrialEnded += 1 }
         if squeeze.phase == .cancelled {
             squeezePickerHideWork?.cancel()
             squeezePickerHideWork = nil
             nativeToolPicker.setVisible(false, forFirstResponder: canvas)
             return
         }
-        guard squeeze.phase == .began || squeeze.phase == .ended else { return }
-        // Distinct from page-open warm-up: activate the real system picker at
-        // squeeze time. The delegate may suppress Apple's default arc; only a
-        // hardware test can determine that. Never draw a substitute palette.
+        guard squeeze.phase == .began || squeeze.phase == .ended,
+              UIPencilInteraction.preferredSqueezeAction != .ignore else { return }
+        // Explicit opt-in diagnostic: activate Apple's picker even when the
+        // per-device Pencil preference is not "Show Tool Palette". The previous
+        // preference guard could have prevented every activation despite many
+        // squeeze callbacks. No custom palette is drawn.
+        squeezeTrialActivations += 1
         nativeToolPicker.setVisible(true, forFirstResponder: canvas)
         canvas.becomeFirstResponder()
+        squeezeTrialFirstResponder = canvas.isFirstResponder
         squeezePickerHideWork?.cancel()
         let activePage = pageID
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.squeezeActivationTrial, self.pageID == activePage else { return }
+            self.squeezeTrialPickerVisible = self.nativeToolPicker.isVisible
+        }
         let hide = DispatchWorkItem { [weak self] in
             guard let self, self.squeezeActivationTrial, self.pageID == activePage,
                   self.pageViewport != nil else { return }
