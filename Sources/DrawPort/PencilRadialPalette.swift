@@ -164,6 +164,7 @@ final class PencilRadialPalette: UIView {
         }
         for (index, button) in colorButtons.enumerated() {
             let ink = [0, 5, 2, 6][index]
+            button.layer.cornerRadius = 17
             button.layer.borderWidth = color == ink ? 2.5 : 0
             button.layer.borderColor = UIColor(red: 0.16, green: 0.53, blue: 1, alpha: 1).cgColor
         }
@@ -217,11 +218,7 @@ final class PencilRadialPalette: UIView {
             swatch.isUserInteractionEnabled = false
             swatch.frame = CGRect(x: 5, y: 5, width: 24, height: 24)
             button.addSubview(swatch)
-            if selectedColor == index {
-                button.layer.cornerRadius = 17
-                button.layer.borderWidth = 2.5
-                button.layer.borderColor = UIColor(red: 0.16, green: 0.53, blue: 1, alpha: 1).cgColor
-            }
+            button.layer.cornerRadius = 17
             button.accessibilityLabel = "\(label) ink"
             button.accessibilityIdentifier = "pencilPalette.\(label)"
             button.addAction(UIAction { [weak self] _ in self?.onAction?(.color(index)) }, for: .touchUpInside)
