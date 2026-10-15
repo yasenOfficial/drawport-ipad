@@ -231,7 +231,7 @@ enum PaperDrawing {
     }
 }
 
-final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInteractionDelegate, UIColorPickerViewControllerDelegate, UIGestureRecognizerDelegate, UIEditMenuInteractionDelegate {
+final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPickerObserver, UIColorPickerViewControllerDelegate, UIGestureRecognizerDelegate, UIEditMenuInteractionDelegate {
     private let store: Store
     private let injectedAIClient: AIClient?
     private let injectedSyncClient: SyncClient?
@@ -300,8 +300,9 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
     private var inkColors: [UIColor] = [.black, .systemBlue, .systemGreen, .systemOrange, .systemYellow, .systemRed, UIColor(red: 0, green: 0.2, blue: 0.8, alpha: 1), QuestionInk.color]
     private var colorSwatches: [Int: UIView] = [:]
     private var editingColorIndex: Int?
-    private weak var squeezeMenu: UIView?
-    private var squeezeInProgress = false
+    // Use Apple's picker only. It is never registered as a visible/docked toolbar.
+    private let nativeToolPicker = PKToolPicker()
+    private var syncingNativeToolPicker = false
     private var eraserByPixel = UserDefaults.standard.bool(forKey: "eraserByPixel")
     private var shapeModeEnabled = false
     private var shapeStartStrokeCount = 0
@@ -379,7 +380,6 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         canvas.accessibilityIdentifier = "drawingCanvas"
         canvas.isScrollEnabled = false
         canvas.delegate = self
-        canvas.addInteraction(UIPencilInteraction(delegate: self))
         let shapeHold = PencilShapeHold(target: nil, action: nil)
         shapeHold.delegate = self
         shapeHold.onHold = { [weak self] in
@@ -497,9 +497,10 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         overviewVisible = false
         bottomPaperFill?.removeFromSuperview()
         bottomPaperFill = nil
-        squeezeMenu?.removeFromSuperview()
-        squeezeMenu = nil
-        squeezeInProgress = false
+        nativeToolPicker.setVisible(false, forFirstResponder: canvas)
+        nativeToolPicker.removeObserver(canvas)
+        nativeToolPicker.removeObserver(self)
+        canvas.resignFirstResponder()
         selectedPages.removeAll()
         selectingPages = false
         cancelCarry()
@@ -1632,6 +1633,17 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         vertical([drawingHeader(book: book, page: page), workArea])
         if keepOverview { displayOverviewPanel() }
         updateBottomSafeAreaChrome()
+        // Leave the native picker attached to PencilKit but not visible in the
+        // ordinary drawing UI. The system, not our app, owns any squeeze palette.
+        nativeToolPicker.overrideUserInterfaceStyle = .dark
+        nativeToolPicker.colorUserInterfaceStyle = .light
+        nativeToolPicker.showsDrawingPolicyControls = false
+        nativeToolPicker.addObserver(canvas)
+        nativeToolPicker.addObserver(self)
+        nativeToolPicker.setVisible(false, forFirstResponder: canvas)
+        canvas.becomeFirstResponder()
+        syncNativeToolSelection()
+        applyTool()
     }
 
     private func endSelectionKeyboardEditing() {
@@ -1710,6 +1722,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         quickArmed = false
         quickEraserQueued = false
         applyTool()
+        if pageViewport != nil { syncNativeToolSelection(); applyTool() }
         if tool == 3 { dismissSelectionKeyboard() }
         updateKeyboardDiagnostics()
         refreshToolbar()
@@ -2152,48 +2165,41 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
     }
 
 
-    func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
-        if squeeze.phase == .changed { return }
-        if squeeze.phase == .cancelled { squeezeInProgress = false; return }
-        // Show promptly for a continuous squeeze; an ended-only callback is a discrete squeeze.
-        if squeeze.phase == .ended && squeezeInProgress { squeezeInProgress = false; return }
-        if squeeze.phase == .began { squeezeInProgress = true }
-        guard pageViewport != nil, !usingTool else { return }
-        if let menu = squeezeMenu {
-            menu.removeFromSuperview()
-            squeezeMenu = nil
-            return
+    private func syncNativeToolSelection() {
+        let match = nativeToolPicker.toolItems.first { item in
+            if currentTool == 3 { return item is PKToolPickerLassoItem }
+            if currentTool == 1 { return item is PKToolPickerEraserItem }
+            guard let ink = item as? PKToolPickerInkingItem else { return false }
+            return (ink.inkingTool.ink.inkType == .marker) == (currentTool == 2)
         }
-        let location = squeeze.hoverPose.map { canvas.convert($0.location, to: view) }
-            ?? CGPoint(x: view.bounds.midX, y: view.bounds.midY)
-        let actions: [PencilSqueezeMenu.Action] = [
-            .init(symbol: "arrow.uturn.backward", label: "Undo", selected: false, perform: { [weak self] in self?.toolbarAction(21) }),
-            .init(symbol: "arrow.uturn.forward", label: "Redo", selected: false, perform: { [weak self] in self?.toolbarAction(22) }),
-            .init(symbol: "pencil.tip", label: "Pen", selected: currentTool == 0 && !quickArmed, perform: { [weak self] in self?.selectTool(0) }),
-            .init(symbol: "highlighter", label: "Highlighter", selected: currentTool == 2 && !quickArmed, perform: { [weak self] in self?.selectTool(2) }),
-            .init(symbol: "eraser.fill", label: "Quick eraser", selected: quickArmed, perform: { [weak self] in self?.toolbarAction(7) }),
-            .init(symbol: "lasso", label: "Selection", selected: currentTool == 3, perform: { [weak self] in self?.selectTool(3) }),
-            .init(symbol: "hand.draw", label: "Carry to next page", selected: carryOverlay != nil, perform: { [weak self] in self?.toggleCarry() }),
-            .init(symbol: "sparkles", label: "AI suggestions", selected: false, perform: { [weak self] in self?.askAI() }),
-            .init(symbol: "plus.circle", label: "New page", selected: false, perform: { [weak self] in self?.toolbarAction(3) }),
-            .init(symbol: "square.grid.2x2", label: "Page overview", selected: false, perform: { [weak self] in self?.toolbarAction(2) })
-        ]
-        let swatches: [PencilSqueezeMenu.Swatch] = [(0, "Black"), (5, "Red"), (2, "Green"), (6, "Blue")].map { index, name in
-            .init(color: inkColors[index], label: name,
-                  selected: currentInk == index,
-                  select: { [weak self] in self?.selectInk(index) },
-                  configure: { [weak self] in
-                      guard let self else { return }
-                      self.editingColorIndex = index
-                      let picker = UIColorPickerViewController()
-                      picker.selectedColor = self.inkColors[index]
-                      picker.supportsAlpha = false
-                      picker.delegate = self
-                      self.present(picker, animated: true)
-                  })
+        guard let match else { return }
+        syncingNativeToolPicker = true
+        nativeToolPicker.selectedToolItemIdentifier = match.identifier
+        syncingNativeToolPicker = false
+    }
+
+    func toolPickerSelectedToolItemDidChange(_ toolPicker: PKToolPicker) {
+        guard pageViewport != nil, !syncingNativeToolPicker else { return }
+        let item = toolPicker.selectedToolItem
+        if let ink = item as? PKToolPickerInkingItem {
+            currentTool = ink.inkingTool.ink.inkType == .marker ? 2 : 0
+            lastInkTool = currentTool
+            UserDefaults.standard.set(currentTool, forKey: "tool")
+            UserDefaults.standard.set(currentTool, forKey: "lastInkTool")
+        } else if item is PKToolPickerLassoItem {
+            currentTool = 3
+            UserDefaults.standard.set(3, forKey: "tool")
+        } else if let eraser = item as? PKToolPickerEraserItem {
+            currentTool = 1
+            eraserByPixel = eraser.eraserTool.eraserType == .bitmap
+            UserDefaults.standard.set(eraserByPixel, forKey: "eraserByPixel")
+            UserDefaults.standard.set(1, forKey: "tool")
         }
-        let menu = PencilSqueezeMenu(in: view, near: location, actions: actions, swatches: swatches)
-        squeezeMenu = menu
+        quickArmed = false
+        shapeModeEnabled = false
+        clearStrokeSelection()
+        canvas.selectionEditingEnabled = currentTool == 3
+        refreshToolbar()
     }
 
     private func clearStrokeSelection() {
