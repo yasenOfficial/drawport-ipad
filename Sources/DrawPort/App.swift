@@ -230,7 +230,7 @@ enum PaperDrawing {
     }
 }
 
-final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPickerObserver, UIColorPickerViewControllerDelegate, UIGestureRecognizerDelegate, UIEditMenuInteractionDelegate {
+final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInteractionDelegate, UIColorPickerViewControllerDelegate, UIGestureRecognizerDelegate, UIEditMenuInteractionDelegate {
     private let store: Store
     private let injectedAIClient: AIClient?
     private let injectedSyncClient: SyncClient?
@@ -280,6 +280,8 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
     private weak var overviewPanel: UIView?
     private var overviewVisible = false
     private var selectedPage: UUID?
+    private var selectedPages = Set<UUID>()
+    private var selectingPages = false
     private var deletedMode = false
     private let paper = PaperView()
     private let canvas = DrawingCanvas()
@@ -297,14 +299,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
     private var inkColors: [UIColor] = [.black, .systemBlue, .systemGreen, .systemOrange, .systemYellow, .systemRed, UIColor(red: 0, green: 0.2, blue: 0.8, alpha: 1), QuestionInk.color]
     private var colorSwatches: [Int: UIView] = [:]
     private var editingColorIndex: Int?
-    // A visible PencilKit picker supplies the system Pencil Pro squeeze palette.
-    private var syncingNativePicker = false
-    private lazy var nativeToolPicker = PKToolPicker(toolItems: [
-        PKToolPickerInkingItem(type: .monoline, color: inkColors[currentInk], width: widths[widthIndex]),
-        PKToolPickerInkingItem(type: .marker, color: inkColors[currentInk], width: markerWidths[markerWidthIndex]),
-        PKToolPickerEraserItem(type: .bitmap), PKToolPickerEraserItem(type: .vector),
-        PKToolPickerLassoItem()
-    ])
+    private weak var squeezeMenu: UIView?
     private var eraserByPixel = UserDefaults.standard.bool(forKey: "eraserByPixel")
     private var shapeModeEnabled = false
     private var shapeStartStrokeCount = 0
@@ -380,6 +375,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         canvas.accessibilityIdentifier = "drawingCanvas"
         canvas.isScrollEnabled = false
         canvas.delegate = self
+        canvas.addInteraction(UIPencilInteraction(delegate: self))
         let shapeHold = PencilShapeHold(target: nil, action: nil)
         shapeHold.delegate = self
         shapeHold.onHold = { [weak self] in
@@ -495,10 +491,10 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         pageArea = nil
         overviewPanel = nil
         overviewVisible = false
-        nativeToolPicker.setVisible(false, forFirstResponder: canvas)
-        nativeToolPicker.removeObserver(canvas)
-        nativeToolPicker.removeObserver(self)
-        canvas.resignFirstResponder()
+        squeezeMenu?.removeFromSuperview()
+        squeezeMenu = nil
+        selectedPages.removeAll()
+        selectingPages = false
         cancelCarry()
         saveWork?.cancel()
         colorSelection = nil
@@ -1600,26 +1596,6 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         workArea.axis = position.isVertical ? .horizontal : .vertical
         vertical([drawingHeader(book: book, page: page), workArea])
         if keepOverview { displayOverviewPanel() }
-        nativeToolPicker.addObserver(canvas)
-        nativeToolPicker.addObserver(self)
-        nativeToolPicker.overrideUserInterfaceStyle = .dark
-        nativeToolPicker.colorUserInterfaceStyle = .light
-        nativeToolPicker.showsDrawingPolicyControls = false
-        // PencilKit shows its own native tool arc for Pencil Pro squeeze when visible.
-        nativeToolPicker.setVisible(true, forFirstResponder: canvas)
-        canvas.becomeFirstResponder()
-        // Adding a picker observer otherwise resets the custom toolbar's active ink.
-        if let match = nativeToolPicker.toolItems.first(where: { item in
-            if currentTool == 3 { return item is PKToolPickerLassoItem }
-            if currentTool == 1 { return item is PKToolPickerEraserItem }
-            guard let ink = item as? PKToolPickerInkingItem else { return false }
-            return ink.inkingTool.ink.inkType == (currentTool == 2 ? .marker : .monoline)
-        }) {
-            syncingNativePicker = true
-            nativeToolPicker.selectedToolItemIdentifier = match.identifier
-            syncingNativePicker = false
-        }
-        applyTool()
     }
 
     private func endSelectionKeyboardEditing() {
@@ -1698,18 +1674,6 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         quickArmed = false
         quickEraserQueued = false
         applyTool()
-        // Keep native squeeze and the custom sidebar on the same selected tool.
-        if pageViewport != nil, let match = nativeToolPicker.toolItems.first(where: { item in
-            if tool == 3 { return item is PKToolPickerLassoItem }
-            guard let ink = item as? PKToolPickerInkingItem else { return false }
-            return ink.inkingTool.ink.inkType == (tool == 2 ? .marker : .monoline)
-        }) {
-            syncingNativePicker = true
-            nativeToolPicker.selectedToolItemIdentifier = match.identifier
-            syncingNativePicker = false
-            applyTool()
-        }
-        if nativeToolPicker.isVisible && canvas.window != nil { canvas.becomeFirstResponder() }
         if tool == 3 { dismissSelectionKeyboard() }
         updateKeyboardDiagnostics()
         refreshToolbar()
@@ -2151,34 +2115,41 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         loadingDrawing = false
     }
 
-    func toolPickerSelectedToolItemDidChange(_ toolPicker: PKToolPicker) {
-        guard pageViewport != nil, !syncingNativePicker else { return }
-        let item = toolPicker.selectedToolItem
-        if let ink = item as? PKToolPickerInkingItem {
-            let marker = ink.inkingTool.ink.inkType == .marker
-            currentTool = marker ? 2 : 0
-            lastInkTool = currentTool
-            UserDefaults.standard.set(currentTool, forKey: "tool")
-            UserDefaults.standard.set(currentTool, forKey: "lastInkTool")
-            let choices = marker ? markerWidths : widths
-            let width = ink.inkingTool.width
-            let nearest = choices.indices.min(by: { abs(choices[$0] - width) < abs(choices[$1] - width) }) ?? 0
-            if marker { markerWidthIndex = nearest } else { widthIndex = nearest }
-        } else if item is PKToolPickerLassoItem {
-            currentTool = 3
-            UserDefaults.standard.set(3, forKey: "tool")
-        } else if let eraser = item as? PKToolPickerEraserItem {
-            currentTool = 1
-            eraserByPixel = eraser.eraserTool.eraserType == .bitmap
-            UserDefaults.standard.set(eraserByPixel, forKey: "eraserByPixel")
-            UserDefaults.standard.set(1, forKey: "tool")
+
+    func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
+        guard squeeze.phase == .ended, pageViewport != nil, !usingTool else { return }
+        if let menu = squeezeMenu {
+            menu.removeFromSuperview()
+            squeezeMenu = nil
+            return
         }
-        quickArmed = false
-        shapeModeEnabled = false
-        clearStrokeSelection()
-        canvas.selectionEditingEnabled = currentTool == 3
-        if toolPicker.isVisible && canvas.window != nil { canvas.becomeFirstResponder() }
-        refreshToolbar()
+        let location = squeeze.hoverPose.map { canvas.convert($0.location, to: view) }
+            ?? CGPoint(x: view.bounds.midX, y: view.bounds.midY)
+        let actions: [PencilSqueezeMenu.Action] = [
+            .init(symbol: "pencil.tip", label: "Pen", perform: { [weak self] in self?.selectTool(0) }),
+            .init(symbol: "highlighter", label: "Marker", perform: { [weak self] in self?.selectTool(2) }),
+            .init(symbol: "eraser.fill", label: "Eraser", perform: { [weak self] in self?.toolbarAction(7) }),
+            .init(symbol: "lasso", label: "Select", perform: { [weak self] in self?.selectTool(3) }),
+            .init(symbol: "paintpalette", label: "Color", perform: { [weak self] in
+                guard let self else { return }
+                if self.currentInk == 7 {
+                    let alert = UIAlertController(title: "Context ink", message: "The question ink's purple shade stays fixed.", preferredStyle: .alert)
+                    alert.addAction(UIAlertAction(title: "OK", style: .default))
+                    self.present(alert, animated: true)
+                } else {
+                    self.editingColorIndex = self.currentInk
+                    let picker = UIColorPickerViewController()
+                    picker.selectedColor = self.inkColors[self.currentInk]
+                    picker.supportsAlpha = false
+                    picker.delegate = self
+                    self.present(picker, animated: true)
+                }
+            }),
+            .init(symbol: "arrow.uturn.backward", label: "Undo", perform: { [weak self] in self?.toolbarAction(21) }),
+            .init(symbol: "arrow.uturn.forward", label: "Redo", perform: { [weak self] in self?.toolbarAction(22) })
+        ]
+        let menu = PencilSqueezeMenu(in: view, near: location, actions: actions)
+        squeezeMenu = menu
     }
 
     private func clearStrokeSelection() {
@@ -2486,6 +2457,8 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         overviewPanel?.removeFromSuperview()
         overviewPanel = nil
         overviewVisible = false
+        selectedPages.removeAll()
+        selectingPages = false
     }
 
     private func displayOverviewPanel() {
@@ -2526,7 +2499,8 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
             home.showsMenuAsPrimaryAction = true
         }
         let deleted = button(deletedMode ? "square.grid.2x2" : "trash", label: deletedMode ? "Pages" : "Deleted pages") { [weak self] in
-            self?.deletedMode.toggle(); self?.selectedPage = nil; self?.overviewScroll = nil; self?.refreshOverview()
+            self?.deletedMode.toggle(); self?.selectedPage = nil; self?.selectedPages.removeAll()
+            self?.selectingPages = false; self?.overviewScroll = nil; self?.refreshOverview()
         }
         let add = button("plus", label: "New page") { [weak self] in
             guard let self, let bookID = self.bookID, self.store.notebook(bookID) != nil, !self.deletedMode else { return }
@@ -2534,17 +2508,30 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
             self.mutate { try self.store.update(bookID) { $0.pages.append(page); $0.currentPage = page.id } }
             self.openPage(page.id)
         }
-        add.isHidden = deletedMode
+        // The page editor already has New page in its top bar.
+        add.isHidden = deletedMode || pageArea != nil
+        let select = button(selectingPages ? "checkmark.circle.fill" : "checkmark.circle", label: selectingPages ? "Done selecting" : "Select pages") { [weak self] in
+            guard let self else { return }
+            self.selectingPages.toggle()
+            self.selectedPages.removeAll()
+            self.selectedPage = nil
+            self.refreshOverview()
+        }
+        select.setImage(nil, for: .normal)
+        select.setTitle(selectingPages ? "Done" : "Select", for: .normal)
+        select.titleLabel?.font = .systemFont(ofSize: 14, weight: .semibold)
         let title = UILabel()
         title.textAlignment = .center
         title.font = .preferredFont(forTextStyle: .headline)
-        title.text = deletedMode ? "Deleted (\(pages.count))" : pageArea == nil ? "\(book.name) • \(pages.count) pages" : "Overview"
+        title.text = selectingPages ? "\(selectedPages.count) selected"
+            : deletedMode ? "Deleted (\(pages.count))" : pageArea == nil ? "\(book.name) • \(pages.count) pages" : "Overview"
         title.textColor = .white
-        let header = UIStackView(arrangedSubviews: [home, title, add, deleted])
+        let header = UIStackView(arrangedSubviews: [home, title, add, select, deleted])
         header.axis = .horizontal
         header.heightAnchor.constraint(equalToConstant: 48).isActive = true
-        for control in [home, deleted] { control.widthAnchor.constraint(equalToConstant: 50).isActive = true }
-        if !deletedMode { add.widthAnchor.constraint(equalToConstant: 50).isActive = true }
+        for control in [home, deleted] { control.widthAnchor.constraint(equalToConstant: 48).isActive = true }
+        select.widthAnchor.constraint(equalToConstant: 64).isActive = true
+        if !add.isHidden { add.widthAnchor.constraint(equalToConstant: 48).isActive = true }
         let modes = UISegmentedControl(items: [UIImage(systemName: "square.grid.2x2")!, UIImage(systemName: "list.bullet")!])
         modes.selectedSegmentIndex = UserDefaults.standard.bool(forKey: "overviewListMode") ? 1 : 0
         modes.addAction(UIAction { [weak self] _ in
@@ -2568,9 +2555,11 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
                 let page = pages[n]
                 let cell = UIButton(type: .custom)
                 cell.backgroundColor = UIColor(red: 1, green: 0.995, blue: 0.956, alpha: 1)
-                cell.layer.borderWidth = page.id == (selectedPage ?? pageID) ? 3 : 0
+                let checked = selectingPages && selectedPages.contains(page.id)
+                cell.layer.borderWidth = checked || (!selectingPages && page.id == (selectedPage ?? pageID)) ? 3 : 0
                 cell.layer.borderColor = UIColor.systemBlue.cgColor
                 cell.accessibilityLabel = "Page \(n + 1)"
+                cell.accessibilityValue = checked ? "Selected" : "Not selected"
                 if let drawing = try? store.drawing(book: bookID, page: page) {
                     cell.setImage(try? PageComposite.image(drawing: drawing, objects: store.objects(book: bookID, page: page),
                         store: store, background: page.background,
@@ -2581,7 +2570,8 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
                 cell.imageView?.contentMode = .scaleAspectFit
                 cell.addAction(UIAction { [weak self] _ in
                     guard let self else { return }
-                    if self.deletedMode { self.selectedPage = page.id; self.refreshOverview() }
+                    if self.selectingPages { self.togglePageSelection(page.id) }
+                    else if self.deletedMode { self.selectedPage = page.id; self.refreshOverview() }
                     else { self.openPage(page.id) }
                 }, for: .touchUpInside)
                 let hold = UILongPressGestureRecognizer(target: self, action: #selector(selectPage(_:)))
@@ -2589,7 +2579,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
                 cell.accessibilityIdentifier = page.id.uuidString
                 cell.addGestureRecognizer(hold)
                 let number = UILabel()
-                number.text = "\(n + 1) ▾"
+                number.text = checked ? "✓ \(n + 1)" : selectingPages ? "○ \(n + 1)" : "\(n + 1) ▾"
                 number.textAlignment = .center
                 number.font = .preferredFont(forTextStyle: .footnote)
                 number.textColor = .label
@@ -2621,12 +2611,27 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
             ("arrow.left", "Move left", { [weak self] in self?.movePage(-1) }),
             ("arrow.right", "Move right", { [weak self] in self?.movePage(1) })
         ]
-        let footer = row(actions.map { symbol, label, action in
-            let b = button(symbol, label: label, action: action)
-            b.isEnabled = selectedPage != nil
-            return b
-        }, height: 48)
-        let panel = UIStackView(arrangedSubviews: selectedPage == nil ? [header, modes, scroll] : [header, modes, scroll, footer])
+        let footer: UIStackView
+        if selectingPages {
+            let all = button("checkmark.rectangle.stack", label: "Select all pages") { [weak self] in
+                guard let self, let book = self.bookID.flatMap(self.store.notebook) else { return }
+                let visible = self.deletedMode ? book.deleted : book.pages
+                self.selectedPages = Set(visible.map(\.id))
+                self.refreshOverview()
+            }
+            let apply = button(deletedMode ? "arrow.uturn.backward" : "trash", label: deletedMode ? "Restore \(selectedPages.count) selected pages" : "Delete \(selectedPages.count) selected pages") { [weak self] in
+                self?.confirmBatchPageAction()
+            }
+            apply.isEnabled = !selectedPages.isEmpty
+            footer = row([all, apply], height: 48)
+        } else {
+            footer = row(actions.map { symbol, label, action in
+                let b = button(symbol, label: label, action: action)
+                b.isEnabled = selectedPage != nil
+                return b
+            }, height: 48)
+        }
+        let panel = UIStackView(arrangedSubviews: selectingPages || selectedPage != nil ? [header, modes, scroll, footer] : [header, modes, scroll])
         panel.axis = .vertical
         panel.spacing = 8
         DispatchQueue.main.async { [weak scroll] in
@@ -2640,8 +2645,60 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
     @objc private func selectPage(_ gesture: UILongPressGestureRecognizer) {
         guard gesture.state == .began, let string = gesture.view?.accessibilityIdentifier,
               let id = UUID(uuidString: string) else { return }
-        selectedPage = id
+        if selectingPages { togglePageSelection(id) }
+        else { selectedPage = id; refreshOverview() }
+    }
+
+    private func togglePageSelection(_ id: UUID) {
+        guard let bookID, let book = store.notebook(bookID),
+              (deletedMode ? book.deleted : book.pages).contains(where: { $0.id == id }) else { return }
+        if !selectedPages.insert(id).inserted { selectedPages.remove(id) }
         refreshOverview()
+    }
+
+    private func confirmBatchPageAction() {
+        guard selectingPages, let bookID, let book = store.notebook(bookID) else { return }
+        let available = deletedMode ? book.deleted : book.pages
+        let ids = selectedPages.intersection(Set(available.map(\.id)))
+        guard !ids.isEmpty else { return }
+        let count = ids.count
+        let restoring = deletedMode
+        let all = !restoring && count == book.pages.count
+        let message = restoring ? "Restore \(count) pages to this notebook?"
+            : "Move \(count) pages to Deleted pages?\(all ? " A new blank page will be created." : "")"
+        let alert = UIAlertController(title: restoring ? "Restore pages" : "Delete pages", message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: restoring ? "Restore" : "Delete", style: restoring ? .default : .destructive) { [weak self] _ in
+            self?.batchPageAction(ids: ids, restoring: restoring, bookID: bookID)
+        })
+        present(alert, animated: true)
+    }
+
+    private func batchPageAction(ids: Set<UUID>, restoring: Bool, bookID: UUID) {
+        do {
+            if pageArea != nil { try saveCanvasIfChanged() }
+            try store.update(bookID) { book in
+            if restoring {
+                let moved = book.deleted.filter { ids.contains($0.id) }
+                book.deleted.removeAll { ids.contains($0.id) }
+                book.pages.append(contentsOf: moved)
+            } else {
+                let moved = book.pages.filter { ids.contains($0.id) }
+                book.pages.removeAll { ids.contains($0.id) }
+                book.deleted.append(contentsOf: moved)
+                if book.pages.isEmpty { book.pages.append(Page()) }
+                if book.currentPage == nil || !book.pages.contains(where: { $0.id == book.currentPage }) {
+                    book.currentPage = book.pages.first?.id
+                }
+            }
+        }
+        } catch { failure(error); return }
+        selectedPages.removeAll()
+        selectingPages = false
+        selectedPage = nil
+        if !restoring, let book = store.notebook(bookID), let current = book.currentPage,
+           pageArea != nil, pageID != current { openPage(current) }
+        else { refreshOverview() }
     }
 
     private func duplicatePage() {
