@@ -1633,17 +1633,24 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         vertical([drawingHeader(book: book, page: page), workArea])
         if keepOverview { displayOverviewPanel() }
         updateBottomSafeAreaChrome()
-        // Leave the native picker attached to PencilKit but not visible in the
-        // ordinary drawing UI. The system, not our app, owns any squeeze palette.
+        // Experiment: briefly activate Apple's picker, then hide it. On iPadOS
+        // 18 the never-activated hidden picker only yielded system Undo/Redo.
+        // No custom squeeze handler/UI is installed. Real Pencil testing will
+        // tell us whether the system retains its native tool arc after hiding.
         nativeToolPicker.overrideUserInterfaceStyle = .dark
         nativeToolPicker.colorUserInterfaceStyle = .light
         nativeToolPicker.showsDrawingPolicyControls = false
         nativeToolPicker.addObserver(canvas)
         nativeToolPicker.addObserver(self)
-        nativeToolPicker.setVisible(false, forFirstResponder: canvas)
+        nativeToolPicker.setVisible(true, forFirstResponder: canvas)
         canvas.becomeFirstResponder()
         syncNativeToolSelection()
         applyTool()
+        let openedPage = page.id
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self, self.pageID == openedPage, self.pageViewport != nil else { return }
+            self.nativeToolPicker.setVisible(false, forFirstResponder: self.canvas)
+        }
     }
 
     private func endSelectionKeyboardEditing() {
