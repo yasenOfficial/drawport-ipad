@@ -280,6 +280,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
     private weak var pageArea: UIStackView?
     private weak var overviewPanel: UIView?
     private var overviewVisible = false
+    private var bottomPaperFill: UIView?
     private var selectedPage: UUID?
     private var selectedPages = Set<UUID>()
     private var selectingPages = false
@@ -350,6 +351,8 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
     private var aiOperations: [UUID: (id: UUID, task: Task<Void, Never>)] = [:]
     private var syncInProgress = false
 
+
+    override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -491,6 +494,8 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         pageArea = nil
         overviewPanel = nil
         overviewVisible = false
+        bottomPaperFill?.removeFromSuperview()
+        bottomPaperFill = nil
         squeezeMenu?.removeFromSuperview()
         squeezeMenu = nil
         selectedPages.removeAll()
@@ -1584,8 +1589,8 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         if book.currentPage != page.id { mutate { try store.update(bookID) { $0.currentPage = page.id } } }
         let keepOverview = overviewVisible
         clear()
-        // Extend the warm paper behind the iPad home-indicator safe area.
-        view.backgroundColor = UIColor(red: 1, green: 0.995, blue: 0.956, alpha: 1)
+        // The status-bar safe area and notebook header form one dark top bar.
+        view.backgroundColor = UIColor(white: 0.105, alpha: 1)
         let work = PageViewport()
         work.accessibilityIdentifier = "pageViewport"
         work.surface.accessibilityIdentifier = "drawingSurface"
@@ -1624,6 +1629,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         workArea.axis = position.isVertical ? .horizontal : .vertical
         vertical([drawingHeader(book: book, page: page), workArea])
         if keepOverview { displayOverviewPanel() }
+        updateBottomSafeAreaChrome()
     }
 
     private func endSelectionKeyboardEditing() {
@@ -2488,6 +2494,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         overviewVisible = false
         selectedPages.removeAll()
         selectingPages = false
+        updateBottomSafeAreaChrome()
     }
 
     private func displayOverviewPanel() {
@@ -2498,6 +2505,32 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, UIPencilInte
         panel.widthAnchor.constraint(equalToConstant: max(250, min(370, view.bounds.width * 0.29))).isActive = true
         overviewPanel = panel
         overviewVisible = true
+        updateBottomSafeAreaChrome()
+    }
+
+    /// Paint only beneath the page, leaving the dark left/right tool strip to
+    /// continue all the way through the home-indicator safe area.
+    private func updateBottomSafeAreaChrome() {
+        bottomPaperFill?.removeFromSuperview()
+        bottomPaperFill = nil
+        guard pageViewport != nil else { return }
+        let position = ToolbarPosition.saved()
+        if position == .bottom { return } // Bottom toolbar itself continues to the screen edge.
+        let paper = UIView()
+        paper.backgroundColor = UIColor(red: 1, green: 0.995, blue: 0.956, alpha: 1)
+        paper.isUserInteractionEnabled = false
+        paper.translatesAutoresizingMaskIntoConstraints = false
+        view.insertSubview(paper, belowSubview: content)
+        let left: CGFloat = position == .left ? 46 : 0
+        let sidebar: CGFloat = overviewVisible ? max(250, min(370, view.bounds.width * 0.29)) : 0
+        let right: CGFloat = (position == .right ? 46 : 0) + sidebar
+        NSLayoutConstraint.activate([
+            paper.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+            paper.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            paper.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: left),
+            paper.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -right)
+        ])
+        bottomPaperFill = paper
     }
 
     private func refreshOverview() {
