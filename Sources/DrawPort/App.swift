@@ -301,21 +301,15 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
     private var colorSwatches: [Int: UIView] = [:]
     private var editingColorIndex: Int?
     private let nativeToolPicker = PKToolPicker()
-    // Session-only diagnostics: neither native-picker experiment is on by default.
+    // Native picker is an optional comparison mode; the on-squeeze UI below
+    // is separate and never creates a persistent PencilKit dock.
     private var nativePickerMinimizeTrial = false
-    private var squeezeActivationTrial = false
-    private var squeezeTrialCallbacks = 0
-    private var squeezeTrialBegan = 0
-    private var squeezeTrialEnded = 0
-    private var squeezeTrialActivations = 0
-    private var squeezeTrialFirstResponder = false
-    private var squeezeTrialPickerVisible = false
+    private var radialPalette: PencilRadialPalette?
     private lazy var squeezeInteraction: UIPencilInteraction = {
         let interaction = UIPencilInteraction(delegate: self)
         interaction.isEnabled = false
         return interaction
     }()
-    private var squeezePickerHideWork: DispatchWorkItem?
     private var syncingNativeToolPicker = false
     private var eraserByPixel = UserDefaults.standard.bool(forKey: "eraserByPixel")
     private var shapeModeEnabled = false
@@ -512,8 +506,8 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         overviewVisible = false
         bottomPaperFill?.removeFromSuperview()
         bottomPaperFill = nil
-        squeezePickerHideWork?.cancel()
-        squeezePickerHideWork = nil
+        radialPalette?.removeFromSuperview()
+        radialPalette = nil
         squeezeInteraction.isEnabled = false
         if #available(iOS 26.0, *) {
             canvas.pencilKitResponderState.toolPickerVisibility = .inactive
@@ -1438,20 +1432,22 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         setting.axis = .vertical
         setting.spacing = 12
         let trialLabel = UILabel()
-        trialLabel.text = "Native picker trial (this session only)"
+        trialLabel.text = "Use Apple's docked picker instead of the squeeze palette (this session only)"
         trialLabel.font = .preferredFont(forTextStyle: .body)
-        let trialModes = UISegmentedControl(items: ["Off", "Auto-minimize", "On squeeze"])
-        trialModes.accessibilityIdentifier = "nativePickerTrialMode"
-        trialModes.selectedSegmentIndex = squeezeActivationTrial ? 2 : nativePickerMinimizeTrial ? 1 : 0
-        trialModes.addAction(UIAction { [weak self, weak trialModes] _ in
-            guard let self, let trialModes else { return }
-            self.nativePickerMinimizeTrial = trialModes.selectedSegmentIndex == 1
-            self.squeezeActivationTrial = trialModes.selectedSegmentIndex == 2
+        trialLabel.numberOfLines = 0
+        let trialSwitch = UISwitch()
+        trialSwitch.accessibilityIdentifier = "nativePickerMinimizeTrial"
+        trialSwitch.isOn = nativePickerMinimizeTrial
+        trialSwitch.addAction(UIAction { [weak self, weak trialSwitch] _ in
+            guard let self, let trialSwitch else { return }
+            self.nativePickerMinimizeTrial = trialSwitch.isOn
         }, for: .valueChanged)
-        setting.addArrangedSubview(trialLabel)
-        setting.addArrangedSubview(trialModes)
+        let trialRow = UIStackView(arrangedSubviews: [trialLabel, trialSwitch])
+        trialRow.axis = .horizontal
+        trialRow.spacing = 12
+        setting.addArrangedSubview(trialRow)
         let trialHelp = UILabel()
-        trialHelp.text = "Pencil setting: \(UIPencilInteraction.preferredSqueezeAction.rawValue). Callbacks: \(squeezeTrialCallbacks) (began \(squeezeTrialBegan), ended \(squeezeTrialEnded)). Activation attempts: \(squeezeTrialActivations). Canvas focused: \(squeezeTrialFirstResponder). Picker visible: \(squeezeTrialPickerVisible). On squeeze may briefly show the lower Apple bar. Auto-minimize leaves a corner control. Both are tests, not the final UI."
+        trialHelp.text = "Off: squeeze-only curved tool menu and no dock. On: the original Apple picker, whose Auto-minimize leaves a corner control."
         trialHelp.font = .preferredFont(forTextStyle: .footnote)
         trialHelp.textColor = .lightGray
         trialHelp.numberOfLines = 0
@@ -1675,9 +1671,8 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         vertical([drawingHeader(book: book, page: page), workArea])
         if keepOverview { displayOverviewPanel() }
         updateBottomSafeAreaChrome()
-        // iPadOS 26 adds a distinct active-but-offscreen picker state. On 18,
-        // programmatic hiding only gives Undo/Redo; the opt-in Auto-minimize
-        // diagnostic exposes the native arc but leaves a small system control.
+        // The native picker remains an explicit comparison mode only; leaving
+        // it inactive avoids any persistent dock or minimized system control.
         nativeToolPicker.overrideUserInterfaceStyle = .dark
         nativeToolPicker.colorUserInterfaceStyle = .light
         nativeToolPicker.showsDrawingPolicyControls = false
@@ -1685,12 +1680,12 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         nativeToolPicker.addObserver(canvas)
         nativeToolPicker.addObserver(self)
         if #available(iOS 26.0, *) {
-            canvas.pencilKitResponderState.activeToolPicker = nativeToolPicker
-            canvas.pencilKitResponderState.toolPickerVisibility = nativePickerMinimizeTrial ? .visible : .hidden
+            canvas.pencilKitResponderState.activeToolPicker = nativePickerMinimizeTrial ? nativeToolPicker : nil
+            canvas.pencilKitResponderState.toolPickerVisibility = nativePickerMinimizeTrial ? .visible : .inactive
         } else {
             nativeToolPicker.setVisible(nativePickerMinimizeTrial, forFirstResponder: canvas)
-            squeezeInteraction.isEnabled = squeezeActivationTrial
         }
+        squeezeInteraction.isEnabled = !nativePickerMinimizeTrial
         canvas.becomeFirstResponder()
         syncNativeToolSelection()
         applyTool()
@@ -2229,40 +2224,42 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
     }
 
     func pencilInteraction(_ interaction: UIPencilInteraction, didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze) {
-        guard squeezeActivationTrial, pageViewport != nil else { return }
-        squeezeTrialCallbacks += 1
-        if squeeze.phase == .began { squeezeTrialBegan += 1 }
-        if squeeze.phase == .ended { squeezeTrialEnded += 1 }
-        if squeeze.phase == .cancelled {
-            squeezePickerHideWork?.cancel()
-            squeezePickerHideWork = nil
-            nativeToolPicker.setVisible(false, forFirstResponder: canvas)
+        guard pageViewport != nil, !nativePickerMinimizeTrial, squeeze.phase == .ended,
+              UIPencilInteraction.preferredSqueezeAction != .ignore else { return }
+        if radialPalette != nil {
+            radialPalette?.removeFromSuperview()
+            radialPalette = nil
             return
         }
-        guard squeeze.phase == .began || squeeze.phase == .ended,
-              UIPencilInteraction.preferredSqueezeAction != .ignore else { return }
-        // Explicit opt-in diagnostic: activate Apple's picker even when the
-        // per-device Pencil preference is not "Show Tool Palette". The previous
-        // preference guard could have prevented every activation despite many
-        // squeeze callbacks. No custom palette is drawn.
-        squeezeTrialActivations += 1
-        nativeToolPicker.setVisible(true, forFirstResponder: canvas)
-        canvas.becomeFirstResponder()
-        squeezeTrialFirstResponder = canvas.isFirstResponder
-        squeezePickerHideWork?.cancel()
-        let activePage = pageID
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.squeezeActivationTrial, self.pageID == activePage else { return }
-            self.squeezeTrialPickerVisible = self.nativeToolPicker.isVisible
+        let location = squeeze.hoverPose?.location ?? CGPoint(x: view.bounds.width * 0.65, y: view.bounds.height * 0.45)
+        let palette = PencilRadialPalette(frame: view.bounds, anchor: location,
+                                          selectedTool: currentTool, selectedColor: currentInk,
+                                          colors: inkColors)
+        palette.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        palette.onAction = { [weak self] action in
+            guard let self else { return }
+            self.radialPalette?.removeFromSuperview()
+            self.radialPalette = nil
+            switch action {
+            case .undo: self.toolbarAction(21)
+            case .redo: self.toolbarAction(22)
+            case .pen: self.selectTool(0)
+            case .highlighter: self.selectTool(2)
+            case .eraser: self.selectTool(1)
+            case .lasso: self.selectTool(3)
+            case .hand: break // Pencil navigation needs a separate canvas gesture; never alter saved ink.
+            case .shapes:
+                let enabled = !self.shapeModeEnabled
+                self.selectTool(0)
+                self.shapeModeEnabled = enabled
+                self.refreshToolbar()
+            case .addPage: self.toolbarAction(3)
+            case .overview: self.toolbarAction(2)
+            case .color(let index): self.selectInk(index)
+            }
         }
-        let hide = DispatchWorkItem { [weak self] in
-            guard let self, self.squeezeActivationTrial, self.pageID == activePage,
-                  self.pageViewport != nil else { return }
-            self.nativeToolPicker.setVisible(false, forFirstResponder: self.canvas)
-            self.squeezePickerHideWork = nil
-        }
-        squeezePickerHideWork = hide
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: hide)
+        view.addSubview(palette)
+        radialPalette = palette
     }
 
     func toolPickerSelectedToolItemDidChange(_ toolPicker: PKToolPicker) {
@@ -2486,6 +2483,8 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
     }
 
     func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) {
+        radialPalette?.removeFromSuperview()
+        radialPalette = nil
         usingTool = true
         shapeFinalizeWork?.cancel()
         shapeStartStrokeCount = canvas.drawing.strokes.count
