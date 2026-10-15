@@ -1,0 +1,11 @@
+.build/
+.swiftpm/
+.bsp/
+xtool/
+*.ipa
+*.app
+*.mobileprovision
+*.p12
+.env
+.env.*
+.DS_Store
