@@ -2234,6 +2234,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         let location = squeeze.hoverPose?.location ?? CGPoint(x: view.bounds.width * 0.65, y: view.bounds.height * 0.45)
         let palette = PencilRadialPalette(frame: view.bounds, anchor: location,
                                           selectedTool: currentTool, selectedColor: currentInk,
+                                          shapesSelected: shapeModeEnabled, rulerSelected: rulerEnabled,
                                           colors: inkColors, extraTools: PencilRadialPalette.ExtraTool.saved())
         palette.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         palette.onCustomize = { [weak self, weak palette] button in
@@ -2250,11 +2251,8 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
             navigation.popoverPresentationController?.sourceRect = button.bounds
             self.present(navigation, animated: true)
         }
-        palette.onAction = { [weak self] action in
-            guard let self else { return }
-            let shown = self.radialPalette
-            self.radialPalette = nil
-            shown?.dismiss()
+        palette.onAction = { [weak self, weak palette] action in
+            guard let self, let palette, self.radialPalette === palette else { return }
             switch action {
             case .undo: self.toolbarAction(21)
             case .redo: self.toolbarAction(22)
@@ -2271,6 +2269,10 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
             case .addPage: self.toolbarAction(3)
             case .overview: self.toolbarAction(2)
             case .color(let index): self.selectInk(index)
+            }
+            if self.radialPalette === palette {
+                palette.updateSelection(tool: self.currentTool, color: self.currentInk,
+                                        shapes: self.shapeModeEnabled, ruler: self.rulerEnabled)
             }
         }
         view.addSubview(palette)

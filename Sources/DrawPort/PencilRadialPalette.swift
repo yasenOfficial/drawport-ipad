@@ -55,15 +55,19 @@ final class PencilRadialPalette: UIView {
     private var colorButtons: [UIButton] = []
     private var extraTools: [ExtraTool]
     private let requestedAnchor: CGPoint
-    private let selectedTool: Int
-    private let selectedColor: Int
+    private var selectedTool: Int
+    private var selectedColor: Int
+    private var shapesSelected: Bool
+    private var rulerSelected: Bool
     private let colors: [UIColor]
 
     init(frame: CGRect, anchor: CGPoint, selectedTool: Int, selectedColor: Int,
-         colors: [UIColor], extraTools: [ExtraTool]) {
+         shapesSelected: Bool, rulerSelected: Bool, colors: [UIColor], extraTools: [ExtraTool]) {
         requestedAnchor = anchor
         self.selectedTool = selectedTool
         self.selectedColor = selectedColor
+        self.shapesSelected = shapesSelected
+        self.rulerSelected = rulerSelected
         self.colors = colors
         self.extraTools = extraTools
         super.init(frame: frame)
@@ -85,6 +89,8 @@ final class PencilRadialPalette: UIView {
         colorArc.lineWidth = 34
         makeToolButtons()
         makeColorButtons()
+        updateSelection(tool: selectedTool, color: selectedColor,
+                        shapes: shapesSelected, ruler: rulerSelected)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -130,8 +136,37 @@ final class PencilRadialPalette: UIView {
         for button in toolButtons { button.removeFromSuperview() }
         toolButtons.removeAll()
         makeToolButtons()
+        updateSelection(tool: selectedTool, color: selectedColor,
+                        shapes: shapesSelected, ruler: rulerSelected)
         setNeedsLayout()
         layoutIfNeeded()
+    }
+
+    func updateSelection(tool: Int, color: Int, shapes: Bool, ruler: Bool) {
+        selectedTool = tool
+        selectedColor = color
+        shapesSelected = shapes
+        rulerSelected = ruler
+        for (index, button) in toolButtons.enumerated() {
+            let selected: Bool
+            switch index {
+            case 2: selected = tool == 0 && !shapes
+            case 3: selected = tool == 2 && !shapes
+            case 4: selected = tool == 1
+            case 5: selected = tool == 3
+            default:
+                let extraIndex = index - 6
+                selected = extraTools.indices.contains(extraIndex)
+                    && ((extraTools[extraIndex] == .shapes && shapes)
+                        || (extraTools[extraIndex] == .ruler && ruler))
+            }
+            button.tintColor = selected ? UIColor(red: 0.13, green: 0.44, blue: 1, alpha: 1) : .white
+        }
+        for (index, button) in colorButtons.enumerated() {
+            let ink = [0, 5, 2, 6][index]
+            button.layer.borderWidth = color == ink ? 2.5 : 0
+            button.layer.borderColor = UIColor(red: 0.16, green: 0.53, blue: 1, alpha: 1).cgColor
+        }
     }
 
     private func makeToolButtons() {
