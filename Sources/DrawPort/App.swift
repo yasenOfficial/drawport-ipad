@@ -2270,7 +2270,6 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
             case .ruler: self.toolbarAction(10)
             case .addPage: self.toolbarAction(3)
             case .overview: self.toolbarAction(2)
-            case .ai: self.askAI()
             case .color(let index): self.selectInk(index)
             }
         }

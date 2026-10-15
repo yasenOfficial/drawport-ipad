@@ -5,12 +5,12 @@ import UIKit
 final class PencilRadialPalette: UIView {
     enum Action {
         case undo, redo, pen, highlighter, eraser, lasso
-        case shapes, ruler, addPage, overview, ai
+        case shapes, ruler, addPage, overview
         case color(Int)
     }
 
     enum ExtraTool: String, CaseIterable {
-        case shapes, ruler, addPage, overview, ai
+        case shapes, ruler, addPage, overview
 
         var title: String {
             switch self {
@@ -18,7 +18,6 @@ final class PencilRadialPalette: UIView {
             case .ruler: "Ruler"
             case .addPage: "New page"
             case .overview: "Page overview"
-            case .ai: "AI suggestions"
             }
         }
         var symbol: String {
@@ -27,7 +26,6 @@ final class PencilRadialPalette: UIView {
             case .ruler: "ruler"
             case .addPage: "plus.square"
             case .overview: "square.grid.2x2"
-            case .ai: "sparkles"
             }
         }
         var action: Action {
@@ -36,7 +34,6 @@ final class PencilRadialPalette: UIView {
             case .ruler: .ruler
             case .addPage: .addPage
             case .overview: .overview
-            case .ai: .ai
             }
         }
 
