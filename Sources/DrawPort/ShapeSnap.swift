@@ -45,7 +45,7 @@ enum ShapeSnap {
     /// Returns nil for short taps, tiny gestures or ambiguous handwriting.
     static func recognized(_ stroke: PKStroke) -> PKStroke? {
         let originals = Array(stroke.path)
-        guard originals.count >= 5 else { return nil }
+        guard (5...4096).contains(originals.count) else { return nil }
         let points = originals.map(\.location)
         let xs = points.map(\.x), ys = points.map(\.y)
         guard let minX = xs.min(), let maxX = xs.max(), let minY = ys.min(), let maxY = ys.max() else { return nil }
