@@ -346,6 +346,10 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
     private var syncMessage = ""
     private let syncStatus = UILabel()
     private let aiObjects = AIObjectsView()
+    private let graphOverlay = StudyGraphOverlay()
+    private lazy var graphStore = StudyGraphStore(root: store.fileRoot)
+    private lazy var referenceStore = StudyReferenceStore(root: store.fileRoot)
+    private var studyGraphs: [StudyGraph] = []
     private var aiButton: UIButton?
     private var aiJournal: AINetworkJournal?
     private lazy var aiClient = injectedAIClient ?? AIClient(endpoint: DrawEndpoints.configured("ai"), token: DrawEndpoints.token)
@@ -508,6 +512,9 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         bottomPaperFill = nil
         radialPalette?.removeFromSuperview()
         radialPalette = nil
+        graphOverlay.removeFromSuperview()
+        graphOverlay.subviews.forEach { $0.removeFromSuperview() }
+        studyGraphs = []
         squeezeInteraction.isEnabled = false
         if #available(iOS 26.0, *) {
             canvas.pencilKitResponderState.toolPickerVisibility = .inactive
@@ -1084,7 +1091,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         let endpoint = DrawEndpoints.configured("ai")
         if endpoint.host?.hasSuffix(".example.invalid") == true || DrawEndpoints.token.isEmpty {
             let alert = UIAlertController(title: "AI suggestions need a server",
-                message: "The original Draw AI workflow and purple context ink are available, but this port has no configured AI service. No page or private note was uploaded.",
+                message: "No private note was uploaded. Interactive graphs and the offline PDF reference library are available in Notebook options. AI correction and citations require a separately configured server; never put an API key in the iPad app.",
                 preferredStyle: .alert)
             alert.addAction(UIAlertAction(title: "OK", style: .default))
             present(alert, animated: true)
@@ -1597,6 +1604,12 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         let more = button("ellipsis", label: "Notebook options") {}
         more.menu = UIMenu(children: [
             UIAction(title: "New page", image: UIImage(systemName: "plus")) { [weak self] _ in self?.toolbarAction(3) },
+            UIAction(title: "Add interactive graph", image: UIImage(systemName: "function")) { [weak self] _ in
+                self?.showAddGraphMenu()
+            },
+            UIAction(title: "Study references", image: UIImage(systemName: "books.vertical")) { [weak self] _ in
+                self?.showStudyReferences()
+            },
             UIAction(title: "Settings", image: UIImage(systemName: "gearshape")) { [weak self] _ in
                 self?.finishSave()
                 self?.showSettings()
@@ -1640,12 +1653,16 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         paper.removeFromSuperview()
         canvas.removeFromSuperview()
         aiObjects.removeFromSuperview()
+        graphOverlay.removeFromSuperview()
         paper.pattern = page.background
         work.surface.addSubview(paper)
         work.surface.addSubview(aiObjects)
         work.surface.addSubview(canvas)
+        work.surface.addSubview(graphOverlay)
         mutate { try aiObjects.load(store.objects(book: bookID, page: page), store: store) }
-        for child in [paper, aiObjects, canvas] {
+        do { studyGraphs = try graphStore.load(book: bookID, page: page.id) }
+        catch { studyGraphs = []; failure(error) }
+        for child in [paper, aiObjects, canvas, graphOverlay] {
             child.translatesAutoresizingMaskIntoConstraints = false
             NSLayoutConstraint.activate([
                 child.topAnchor.constraint(equalTo: work.surface.topAnchor),
@@ -1657,8 +1674,11 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         documentPageSize = DocumentOrientation(metadata: book.orientation).pageSize
         let bounds = drawing.bounds
         let objects = store.objects(book: bookID, page: page)
-        pageInkSize = CGSize(width: max(bounds.isNull ? 0 : bounds.maxX, CGFloat(objects.map { $0.frame.x + $0.frame.width }.max() ?? 0)),
-                             height: max(bounds.isNull ? 0 : bounds.maxY, CGFloat(objects.map { $0.frame.y + $0.frame.height }.max() ?? 0)))
+        pageInkSize = CGSize(width: max(bounds.isNull ? 0 : bounds.maxX, CGFloat(objects.map { $0.frame.x + $0.frame.width }.max() ?? 0),
+                                      CGFloat(studyGraphs.map { $0.x + 370 }.max() ?? 0)),
+                             height: max(bounds.isNull ? 0 : bounds.maxY, CGFloat(objects.map { $0.frame.y + $0.frame.height }.max() ?? 0),
+                                         CGFloat(studyGraphs.map { $0.y + 285 }.max() ?? 0)))
+        reloadStudyGraphCards()
         setDrawing(drawing)
         applyTool()
         let position = ToolbarPosition.saved()
@@ -1689,6 +1709,101 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         canvas.becomeFirstResponder()
         syncNativeToolSelection()
         applyTool()
+    }
+
+    private func reloadStudyGraphCards() {
+        graphOverlay.subviews.forEach { $0.removeFromSuperview() }
+        for graph in studyGraphs {
+            let card = StudyGraphCard(graph: graph)
+            card.onCommit = { [weak self] changed in
+                guard let self, let book = self.bookID, let page = self.pageID,
+                      let index = self.studyGraphs.firstIndex(where: { $0.id == changed.id }) else { return }
+                var updated = self.studyGraphs
+                updated[index] = changed
+                do {
+                    try self.graphStore.save(updated, book: book, page: page)
+                    self.studyGraphs = updated
+                } catch {
+                    self.failure(error)
+                    self.reloadStudyGraphCards() // Revert the unsaved slider/position.
+                }
+            }
+            card.onRemove = { [weak self] id in self?.confirmGraphRemoval(id) }
+            card.onExport = { [weak self] graph in self?.exportInteractiveGraph(graph) }
+            graphOverlay.addSubview(card)
+        }
+    }
+
+    private func showStudyReferences() {
+        guard presentedViewController == nil else { return }
+        let library = StudyReferenceLibrary(store: referenceStore)
+        let navigation = UINavigationController(rootViewController: library)
+        navigation.modalPresentationStyle = .pageSheet
+        present(navigation, animated: true)
+    }
+
+    private func showAddGraphMenu() {
+        guard bookID != nil, pageID != nil, pageViewport != nil,
+              studyGraphs.count < 16, presentedViewController == nil else { return }
+        let alert = UIAlertController(title: "Interactive graph", message: "Choose an offline graph with a live parameter slider and values table.", preferredStyle: .actionSheet)
+        for kind in StudyGraph.Kind.allCases {
+            alert.addAction(UIAlertAction(title: kind.title, style: .default) { [weak self] _ in
+                self?.addStudyGraph(kind)
+            })
+        }
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.popoverPresentationController?.sourceView = view
+        alert.popoverPresentationController?.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 1, height: 1)
+        present(alert, animated: true)
+    }
+
+    private func addStudyGraph(_ kind: StudyGraph.Kind) {
+        guard let book = bookID, let page = pageID, let viewport = pageViewport,
+              studyGraphs.count < 16 else { return }
+        let offset = Double(studyGraphs.count % 6) * 25
+        let width = max(Double(viewport.surface.bounds.width), Double(documentPageSize.width))
+        let height = max(Double(viewport.surface.bounds.height), Double(documentPageSize.height))
+        let graph = StudyGraph(kind: kind,
+                               x: min(80 + offset, max(0, width - 370)),
+                               y: min(110 + offset, max(0, height - 285)))
+        let updated = studyGraphs + [graph]
+        do {
+            try graphStore.save(updated, book: book, page: page)
+            studyGraphs = updated
+            reloadStudyGraphCards()
+        } catch { failure(error) }
+    }
+
+    private func confirmGraphRemoval(_ id: UUID) {
+        guard let book = bookID, let page = pageID,
+              studyGraphs.contains(where: { $0.id == id }), presentedViewController == nil else { return }
+        let alert = UIAlertController(title: "Remove interactive graph?", message: "This removes only the graph, not any handwritten ink.", preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Remove", style: .destructive) { [weak self] _ in
+            guard let self, self.bookID == book, self.pageID == page else { return }
+            let updated = self.studyGraphs.filter { $0.id != id }
+            do {
+                try self.graphStore.save(updated, book: book, page: page)
+                self.studyGraphs = updated
+                self.reloadStudyGraphCards()
+            } catch { self.failure(error) }
+        })
+        present(alert, animated: true)
+    }
+
+    private func exportInteractiveGraph(_ graph: StudyGraph) {
+        guard presentedViewController == nil, studyGraphs.contains(where: { $0.id == graph.id }) else { return }
+        do {
+            let directory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("GraphExports", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let url = directory.appendingPathComponent("Graph-\(graph.id.uuidString).html")
+            try StudyGraphHTML.document(graph).write(to: url, atomically: true, encoding: .utf8)
+            let activity = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+            activity.popoverPresentationController?.sourceView = view
+            activity.popoverPresentationController?.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 1, height: 1)
+            present(activity, animated: true)
+        } catch { failure(error) }
     }
 
     private func endSelectionKeyboardEditing() {

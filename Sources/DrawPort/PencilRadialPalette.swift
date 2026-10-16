@@ -254,7 +254,7 @@ final class PencilRadialPalette: UIView {
             }
             return result
         }
-        toolArc.path = path(radius: radius, start: 160, end: 318).cgPath
+        toolArc.path = path(radius: radius, start: 164, end: 314).cgPath
         colorArc.path = path(radius: colorRadius, start: 200, end: 248).cgPath
         let scale = UIScreen.main.scale
         func centeredFrame(_ location: CGPoint) -> CGRect {
@@ -264,7 +264,7 @@ final class PencilRadialPalette: UIView {
         }
         let count = toolButtons.count
         for (index, button) in toolButtons.enumerated() {
-            let angle = CGFloat(164) + CGFloat(index) * 150 / CGFloat(max(1, count - 1))
+            let angle = CGFloat(168) + CGFloat(index) * 142 / CGFloat(max(1, count - 1))
             button.frame = centeredFrame(point(radius: radius, degrees: angle))
         }
         for (offset, angle) in ([201.0, 216.0, 232.0, 247.0] as [CGFloat]).enumerated() {
