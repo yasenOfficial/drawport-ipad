@@ -204,13 +204,13 @@ final class StudyReferenceLibrary: UITableViewController, UIDocumentPickerDelega
     private var eligibleIDs: Set<UUID> = []
 
     init(store: StudyReferenceStore, notebooks: Store, activeNotebookID: UUID?,
-         activeNotebookFolderID: UUID?, pinnedIDs: Set<UUID>) {
+         activeNotebookFolderID: UUID?, startingFolderID: UUID?, pinnedIDs: Set<UUID>) {
         self.store = store
         self.notebooks = notebooks
         self.activeNotebookID = activeNotebookID
         self.activeNotebookFolderID = activeNotebookFolderID
         self.pinnedIDs = pinnedIDs
-        browsingFolderID = activeNotebookFolderID
+        browsingFolderID = startingFolderID
         super.init(style: .insetGrouped)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -242,14 +242,16 @@ final class StudyReferenceLibrary: UITableViewController, UIDocumentPickerDelega
                                                             style: .plain, target: self, action: #selector(back))
         let current = activeNotebookFolderID.flatMap { Folder.path(of: $0, in: folders) }
         let scope = current ?? "Unassigned"
-        eligibleIDs = Set((try? store.eligible(folderID: activeNotebookFolderID, folders: folders,
-                                                pinnedIDs: pinnedIDs))?.map(\.id) ?? [])
+        eligibleIDs = activeNotebookID == nil ? [] : Set((try? store.eligible(
+            folderID: activeNotebookFolderID, folders: folders, pinnedIDs: pinnedIDs))?.map(\.id) ?? [])
         let eligibleCount = eligibleIDs.count
         let label = UILabel(frame: CGRect(x: 16, y: 8, width: max(250, tableView.bounds.width - 32), height: 76))
         label.numberOfLines = 3
         label.font = .systemFont(ofSize: 14)
         label.textColor = .secondaryLabel
-        label.text = "Selected for notebook: \(scope) · \(eligibleCount) PDF(s). ✓ marks included files; swipe a PDF to pin it explicitly. AI is not connected yet."
+        label.text = activeNotebookID == nil
+            ? "Browse and import PDFs in this folder. No notebook is open; no references are selected for AI. AI is not connected yet."
+            : "Selected for notebook: \(scope) · \(eligibleCount) PDF(s). ✓ marks included files; swipe a PDF to pin it explicitly. AI is not connected yet."
         let header = UIView(frame: CGRect(x: 0, y: 0, width: tableView.bounds.width, height: 94))
         header.addSubview(label)
         label.autoresizingMask = [.flexibleWidth]

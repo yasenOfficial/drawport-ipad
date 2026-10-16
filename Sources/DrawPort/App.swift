@@ -619,7 +619,17 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         title.font = .preferredFont(forTextStyle: .title1)
         let settings = button("gearshape", label: "Settings") { [weak self] in self?.showSettings() }
         let newFolder = button("folder.badge.plus", label: "New folder") { [weak self] in self?.askFolderName() }
-        var controls: [UIView] = [newFolder, title, settings, sync, head]
+        let resources = UIButton(type: .system)
+        var resourcesStyle = UIButton.Configuration.plain()
+        resourcesStyle.image = UIImage(systemName: "books.vertical")
+        resourcesStyle.title = "Resources"
+        resourcesStyle.imagePadding = 6
+        resourcesStyle.baseForegroundColor = UIColor(white: 0.96, alpha: 1)
+        resources.configuration = resourcesStyle
+        resources.accessibilityIdentifier = "home.resources"
+        resources.accessibilityLabel = "Open Resources"
+        resources.addAction(UIAction { [weak self] _ in self?.showStudyReferences() }, for: .touchUpInside)
+        var controls: [UIView] = [newFolder, title, resources, settings, sync, head]
         if let folder {
             let parentName = folder.parentID.flatMap { Folder.path(of: $0, in: store.folders) } ?? "Documents"
             let back = button("chevron.left", label: "Back to \(parentName)") { [weak self] in
@@ -1784,8 +1794,10 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
     private func showStudyReferences() {
         guard presentedViewController == nil else { return }
         let folderID = bookID.flatMap { store.notebook($0)?.folderID }
+        let startingFolderID = bookID == nil ? homeFolderID : folderID
         let library = StudyReferenceLibrary(store: referenceStore, notebooks: store,
                                              activeNotebookID: bookID, activeNotebookFolderID: folderID,
+                                             startingFolderID: startingFolderID,
                                              pinnedIDs: bookID.flatMap { selectedReferencesByNotebook[$0] } ?? [])
         library.onPinsChange = { [weak self, id = bookID] pins in
             guard let self, let id else { return }
