@@ -20,16 +20,24 @@ KEY_PATH = Path.home() / ".config/drawport/openrouter.key"
 
 
 def credential():
+    def normalize(value):
+        value = value.strip()
+        # A locally stored 64-hex suffix is also accepted; the non-secret
+        # OpenRouter key prefix is restored only in memory, never logged.
+        if len(value) == 64 and all(ch in "0123456789abcdefABCDEF" for ch in value):
+            return "sk-or-v1-" + value
+        return value if value.startswith("sk-or-v1-") else None
+
     value = os.environ.get("OPENROUTER_API_KEY")
     if value:
-        return value.strip()
+        return normalize(value)
     try:
         meta = KEY_PATH.lstat()
         if not stat.S_ISREG(meta.st_mode) or meta.st_uid != os.getuid() or meta.st_mode & 0o077:
             raise ValueError("key file permissions")
         if not 20 <= meta.st_size <= 256:
             raise ValueError("key file size")
-        return KEY_PATH.read_text(encoding="ascii").strip()
+        return normalize(KEY_PATH.read_text(encoding="ascii"))
     except (FileNotFoundError, ValueError, UnicodeError):
         return None
 
@@ -61,7 +69,10 @@ def main():
     payload = {"model": MODEL,
                "messages": [{"role": "system", "content": "Answer in one short Bulgarian sentence. No tools."},
                             {"role": "user", "content": "Публичен тест: колко е 2 + 2?"}],
-               "max_tokens": 80, "temperature": 0, "stream": True,
+               "max_tokens": 300, "temperature": 0, "stream": True,
+               # This free model requires reasoning. Cap that budget so a
+               # small prompt does not exhaust all output before visible text.
+               "reasoning": {"max_tokens": 32},
                "stream_options": {"include_usage": True}}
     started = time.monotonic()
     first = None
