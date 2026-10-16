@@ -1,8 +1,11 @@
+import CryptoKit
 import Foundation
+import PencilKit
 import UIKit
+import Vision
 
-/// Only the private signer injects this tailnet HTTPS URL. No provider key,
-/// study material, or private tailnet address is present in public source.
+/// Only a private signing stage injects a tailnet HTTPS URL. The OpenRouter
+/// credential never enters the IPA or this source repository.
 enum StudyAIConfiguration {
     static var endpoint: URL? {
         guard let raw = Bundle.main.object(forInfoDictionaryKey: "DrawPortStudyAIURL") as? String,
@@ -17,85 +20,79 @@ enum StudyAIConfiguration {
 private struct StudyQuestion: Encodable { let version = 1; let question: String }
 private struct StudyStreamEvent: Decodable { let delta: String?; let error: String?; let done: Bool? }
 
-enum StudyAITransportError: LocalizedError {
-    case badResponse, model(String)
+enum StudyAIError: LocalizedError {
+    case noPurpleInk, tooMuchInk, unreadable, server
     var errorDescription: String? {
         switch self {
-        case .badResponse: "The study server did not provide a valid answer. Your notes were not sent."
-        case .model(let text): text
+        case .noPurpleInk: "Write the question in purple ink on this page first. No data was sent."
+        case .tooMuchInk: "The purple area is too large to read safely. No data was sent."
+        case .unreadable: "The iPad could not read the purple handwriting. No data was sent. Try writing it more clearly in purple."
+        case .server: "Study AI is unavailable. The notebook was not changed."
         }
     }
 }
 
-/// A plain-text streaming answer. No suggestions are applied to the notebook;
-/// closing the sheet cancels the request. A user explicitly types and confirms
-/// the exact text sent. Only that text, not PencilKit/page/PDF data, is uploaded.
-final class StudyAIAnswerController: UIViewController {
-    private let endpoint: URL
-    private let question: String
-    private let answer = UITextView()
-    private let progress = UILabel()
-    private var operation: Task<Void, Never>?
-    private var started = false
+struct StudyPurpleContext {
+    let recognizedText: String
+    let sourceHash: String
+    let bounds: CGRect
+}
 
-    init(endpoint: URL, question: String) {
-        self.endpoint = endpoint
-        self.question = question
-        super.init(nibName: nil, bundle: nil)
-    }
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    override func viewDidLoad() {
-        super.viewDidLoad()
-        title = "Study AI"
-        view.backgroundColor = UIColor(red: 1, green: 0.995, blue: 0.956, alpha: 1)
-        navigationItem.rightBarButtonItem = UIBarButtonItem(barButtonSystemItem: .done,
-                                                              target: self, action: #selector(close))
-        let questionLabel = UILabel()
-        questionLabel.text = "Question: " + question
-        questionLabel.numberOfLines = 0
-        questionLabel.font = .preferredFont(forTextStyle: .headline)
-        questionLabel.textColor = .label
-        progress.text = "Waiting for the free model…"
-        progress.font = .preferredFont(forTextStyle: .footnote)
-        progress.textColor = .secondaryLabel
-        answer.isEditable = false
-        answer.backgroundColor = .clear
-        answer.font = .preferredFont(forTextStyle: .body)
-        answer.textColor = .label
-        answer.accessibilityIdentifier = "studyAI.streamingAnswer"
-        let stack = UIStackView(arrangedSubviews: [questionLabel, progress, answer])
-        stack.axis = .vertical
-        stack.spacing = 12
-        view.addSubview(stack)
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 20),
-            stack.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -20),
-            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
-            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24)
-        ])
-    }
-
-    override func viewDidAppear(_ animated: Bool) {
-        super.viewDidAppear(animated)
-        guard !started else { return }
-        started = true
-        operation = Task { [weak self] in
-            guard let self else { return }
-            do { try await self.stream() }
-            catch is CancellationError { return }
-            catch { self.progress.text = "Unavailable"; self.answer.text += "\n" + error.localizedDescription }
+/// Strictly filter semantic purple Pencil strokes BEFORE creating the OCR
+/// bitmap. Vision runs on-device. Neither bitmap nor other ink/PDF leaves the
+/// iPad. OCR text is shown on the actual page for confirmation before upload.
+enum StudyPurpleCapture {
+    @MainActor static func recognize(_ drawing: PKDrawing) async throws -> StudyPurpleContext {
+        let strokes = drawing.strokes.filter { QuestionInk.matches($0.ink.color) }
+        guard !strokes.isEmpty else { throw StudyAIError.noPurpleInk }
+        guard strokes.count <= 1_200 else { throw StudyAIError.tooMuchInk }
+        let purple = PKDrawing(strokes: strokes)
+        let raw = purple.bounds
+        guard !raw.isNull, !raw.isEmpty,
+              [raw.minX, raw.minY, raw.width, raw.height].allSatisfy(\.isFinite),
+              raw.width <= 2_000, raw.height <= 2_000 else { throw StudyAIError.tooMuchInk }
+        let region = raw.insetBy(dx: -16, dy: -16).integral
+        guard region.width > 10, region.height > 10,
+              region.width * region.height <= 2_000_000 else { throw StudyAIError.tooMuchInk }
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 2
+        format.opaque = true
+        let image = UIGraphicsImageRenderer(size: region.size, format: format).image { renderer in
+            UIColor.white.setFill()
+            renderer.cgContext.fill(CGRect(origin: .zero, size: region.size))
+            purple.image(from: region, scale: 2).draw(in: CGRect(origin: .zero, size: region.size))
         }
+        guard let cgImage = image.cgImage, let png = image.pngData(), png.count <= 5_000_000 else {
+            throw StudyAIError.tooMuchInk
+        }
+        let sourceHash = SHA256.hash(data: png).map { String(format: "%02x", $0) }.joined()
+        let text = try await Task.detached(priority: .userInitiated) { () throws -> String in
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = .accurate
+            request.usesLanguageCorrection = false // Prefer equations to autocorrected prose.
+            let supported = (try? request.supportedRecognitionLanguages()) ?? ["en-US"]
+            request.recognitionLanguages = supported.contains("bg-BG") ? ["bg-BG", "en-US"] : ["en-US"]
+            try VNImageRequestHandler(cgImage: cgImage).perform([request])
+            let observations = (request.results ?? []).sorted {
+                if abs($0.boundingBox.midY - $1.boundingBox.midY) > 0.03 {
+                    return $0.boundingBox.midY > $1.boundingBox.midY
+                }
+                return $0.boundingBox.minX < $1.boundingBox.minX
+            }
+            return observations.prefix(40).compactMap { $0.topCandidates(1).first?.string }
+                .joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        }.value
+        guard text.count >= 2, text.count <= 700 else { throw StudyAIError.unreadable }
+        return StudyPurpleContext(recognizedText: text, sourceHash: sourceHash, bounds: raw)
     }
+}
 
-    override func viewWillDisappear(_ animated: Bool) {
-        super.viewWillDisappear(animated)
-        if isBeingDismissed || navigationController?.isBeingDismissed == true { operation?.cancel() }
-    }
-    @objc private func close() { operation?.cancel(); dismiss(animated: true) }
-
-    private func stream() async throws {
+/// Bounded streaming plain text. The host accepts only {version,question}; no
+/// legacy notebook capture, strokes, PDF or automatic graph proposal are sent.
+enum StudyAIStream {
+    static func ask(_ question: String, endpoint: URL,
+                    onText: @escaping @MainActor (String) -> Void) async throws {
+        guard (1...700).contains(question.count) else { throw StudyAIError.unreadable }
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 48
         config.timeoutIntervalForResource = 55
@@ -107,11 +104,10 @@ final class StudyAIAnswerController: UIViewController {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.httpBody = try JSONEncoder().encode(StudyQuestion(question: question))
-        guard let body = request.httpBody, body.count <= 2_000 else { throw StudyAITransportError.badResponse }
+        guard let body = request.httpBody, body.count <= 2_000 else { throw StudyAIError.unreadable }
         let (stream, response) = try await session.bytes(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200,
-              http.mimeType == "text/event-stream" else { throw StudyAITransportError.badResponse }
-        progress.text = "Answering…"
+              http.mimeType == "text/event-stream" else { throw StudyAIError.server }
         var total = 0
         var finished = false
         for try await line in stream.lines {
@@ -119,15 +115,14 @@ final class StudyAIAnswerController: UIViewController {
             guard line.hasPrefix("data: "), let bytes = String(line.dropFirst(6)).data(using: .utf8),
                   bytes.count <= 5_000 else { continue }
             let event = try JSONDecoder().decode(StudyStreamEvent.self, from: bytes)
-            if let error = event.error { throw StudyAITransportError.model(String(error.prefix(200))) }
+            if event.error != nil { throw StudyAIError.server }
             if let delta = event.delta {
                 total += delta.count
-                guard total <= 4_000 else { throw StudyAITransportError.badResponse }
-                answer.text += delta
+                guard total <= 4_000 else { throw StudyAIError.server }
+                await onText(delta)
             }
             if event.done == true { finished = true; break }
         }
-        guard finished, total > 0 else { throw StudyAITransportError.badResponse }
-        progress.text = "Answer complete · text only · not saved to the notebook"
+        guard finished, total > 0 else { throw StudyAIError.server }
     }
 }

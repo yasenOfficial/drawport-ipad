@@ -128,7 +128,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not free_now():
                 return self.reply(503, "The chosen model is not currently free")
             payload = {"model": MODEL, "messages": [
-                {"role": "system", "content": "You are a concise Bulgarian study tutor. Explain accurately. Never invent sources or claim to have read a PDF. No tools. If unsure, say so."},
+                {"role": "system", "content": "You are a concise Bulgarian study tutor. Answer in plain text only (no Markdown, headings or asterisks), preferably under 120 words. Explain accurately. Never invent sources or claim to have read a PDF. No tools. If unsure, say so."},
                 {"role": "user", "content": question}],
                 "temperature": 0, "max_tokens": 420, "reasoning": {"max_tokens": 32},
                 "stream": True, "stream_options": {"include_usage": True}}

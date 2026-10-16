@@ -349,9 +349,13 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
     private let graphOverlay = StudyGraphOverlay()
     private lazy var graphStore = StudyGraphStore(root: store.fileRoot)
     private lazy var visualStore = StudyVisualStore(root: store.fileRoot)
+    private lazy var answerStore = StudyAnswerStore(root: store.fileRoot)
     private lazy var referenceStore = StudyReferenceStore(root: store.fileRoot)
     private var studyGraphs: [StudyGraph] = []
     private var studyVisuals: [StudyVisualAsset] = []
+    private var studyAnswers: [StudyAnswerNote] = []
+    private var studyAnswerPreview: StudyAnswerCard?
+    private var studyAnswerTask: Task<Void, Never>?
     // Explicit cross-folder references are session-only, never silently carried
     // across an app relaunch or forwarded to the unconfigured AI endpoint.
     private var selectedReferencesByNotebook: [UUID: Set<UUID>] = [:]
@@ -506,6 +510,9 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
     }
 
     private func clear() {
+        studyAnswerTask?.cancel()
+        studyAnswerTask = nil
+        studyAnswerPreview = nil
         shapeFinalizeWork?.cancel()
         shapeFinalizeWork = nil
         shapeCandidatePage = nil
@@ -522,6 +529,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         graphOverlay.subviews.forEach { $0.removeFromSuperview() }
         studyGraphs = []
         studyVisuals = []
+        studyAnswers = []
         squeezeInteraction.isEnabled = false
         if #available(iOS 26.0, *) {
             canvas.pencilKitResponderState.toolPickerVisibility = .inactive
@@ -1122,7 +1130,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
 
     private func askAI() {
         if let endpoint = StudyAIConfiguration.endpoint {
-            askStudyQuestion(endpoint: endpoint)
+            askPurpleStudy(endpoint: endpoint)
             return
         }
         let endpoint = DrawEndpoints.configured("ai")
@@ -1188,35 +1196,89 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         aiOperations[id] = (operationID, operation)
     }
 
-    /// Typed-question first: no legacy full-notebook capture/upload is used by
-    /// the private OpenRouter proxy. Only the exact confirmed text is sent.
-    private func askStudyQuestion(endpoint: URL) {
-        guard bookID != nil, pageID != nil, presentedViewController == nil else { return }
-        let prompt = UIAlertController(title: "Ask Study AI", message: "Type a question. No handwritten notes, pages or PDFs are included.", preferredStyle: .alert)
-        prompt.addTextField { field in
-            field.placeholder = "Your question"
-            field.autocorrectionType = .yes
-            field.accessibilityIdentifier = "studyAI.question"
+    /// Read only the current page's semantic purple Pencil ink. Vision OCR is
+    /// local; the student checks its text in a card ON the paper before sending.
+    /// No image, full page, PDF or legacy AI notebook upload reaches the proxy.
+    private func askPurpleStudy(endpoint: URL) {
+        guard let book = bookID, let page = pageID, pageViewport != nil,
+              studyAnswerPreview == nil, studyAnswers.count < 8 else { return }
+        let card = StudyAnswerCard(pageSize: documentPageSize)
+        studyAnswerPreview = card
+        graphOverlay.addSubview(card)
+        card.onClose = { [weak self, weak card] in
+            guard let self, let card else { return }
+            self.studyAnswerTask?.cancel()
+            self.studyAnswerTask = nil
+            self.studyAnswerPreview = nil
+            card.removeFromSuperview()
         }
-        prompt.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        prompt.addAction(UIAlertAction(title: "Continue…", style: .default) { [weak self, weak prompt] _ in
-            guard let self, let question = prompt?.textFields?.first?.text?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-                  !question.isEmpty, question.count <= 700 else { return }
-            let confirmation = UIAlertController(title: "Send this question?",
-                message: "Only this text goes to the private study proxy and its OpenRouter free-model provider:\n\n\(question)",
-                preferredStyle: .alert)
-            confirmation.addAction(UIAlertAction(title: "Keep private", style: .cancel))
-            confirmation.addAction(UIAlertAction(title: "Send question", style: .default) { [weak self] _ in
-                guard let self else { return }
-                let answer = StudyAIAnswerController(endpoint: endpoint, question: question)
-                let navigation = UINavigationController(rootViewController: answer)
-                navigation.modalPresentationStyle = .pageSheet
-                self.present(navigation, animated: true)
-            })
-            self.present(confirmation, animated: true)
-        })
-        present(prompt, animated: true)
+        studyAnswerTask = Task { @MainActor [weak self, weak card] in
+            guard let self, let card else { return }
+            do {
+                try await self.waitForPencilEnd()
+                try self.saveCanvasIfChanged()
+                let context = try await StudyPurpleCapture.recognize(self.canvas.drawing)
+                try Task.checkCancellation()
+                guard self.bookID == book, self.pageID == page,
+                      self.studyAnswerPreview === card else { return }
+                let maxX = max(0, self.documentPageSize.width - StudyAnswerCard.cardSize.width)
+                let maxY = max(0, self.documentPageSize.height - StudyAnswerCard.cardSize.height)
+                card.frame.origin = CGPoint(x: min(max(0, context.bounds.minX), maxX),
+                    y: min(max(0, context.bounds.maxY + 20), maxY))
+                card.showPreview(context.recognizedText)
+                card.onSend = { [weak self, weak card] in
+                    guard let self, let card else { return }
+                    self.sendPurpleQuestion(context, endpoint: endpoint, book: book, page: page, card: card)
+                }
+            } catch is CancellationError { return }
+            catch { card.showStatus(error.localizedDescription) }
+        }
+    }
+
+    private func sendPurpleQuestion(_ context: StudyPurpleContext, endpoint: URL,
+                                    book: UUID, page: UUID, card: StudyAnswerCard) {
+        guard bookID == book, pageID == page, studyAnswerPreview === card,
+              studyAnswers.count < 8 else { return }
+        card.onSend = nil // One tap, one provider request. No stroke-by-stroke calls.
+        card.showStatus("Checking that the purple ink has not changed…")
+        studyAnswerTask?.cancel()
+        studyAnswerTask = Task { @MainActor [weak self, weak card] in
+            guard let self, let card else { return }
+            do {
+                let current = try await StudyPurpleCapture.recognize(self.canvas.drawing)
+                guard current.sourceHash == context.sourceHash,
+                      current.recognizedText == context.recognizedText else {
+                    throw StudyAIError.unreadable
+                }
+                try Task.checkCancellation()
+                guard self.bookID == book, self.pageID == page,
+                      self.studyAnswerPreview === card else { return }
+                card.beginAnswer()
+                try await StudyAIStream.ask(context.recognizedText, endpoint: endpoint) { [weak card] delta in
+                    card?.appendAnswer(delta)
+                }
+                try Task.checkCancellation()
+                guard self.bookID == book, self.pageID == page,
+                      self.studyAnswerPreview === card else { return }
+                card.finishAnswer()
+                card.onKeep = { [weak self, weak card] text, origin in
+                    guard let self, let card, self.bookID == book, self.pageID == page,
+                          self.studyAnswerPreview === card, self.studyAnswers.count < 8 else { return }
+                    let note = StudyAnswerNote(id: UUID(), sourceSHA256: context.sourceHash,
+                        recognizedQuestion: context.recognizedText, answer: text,
+                        x: Double(origin.x), y: Double(origin.y))
+                    do {
+                        try self.answerStore.save(self.studyAnswers + [note], book: book, page: page)
+                        self.studyAnswers.append(note)
+                        self.studyAnswerPreview = nil
+                        card.markSaved()
+                        card.onClose = { [weak self] in self?.confirmAnswerRemoval(note.id) }
+                        card.onKeep = { [weak self] _, position in self?.moveSavedAnswer(note.id, to: position) }
+                    } catch { card.showStatus("Could not keep answer: " + error.localizedDescription) }
+                }
+            } catch is CancellationError { return }
+            catch { card.showStatus(error.localizedDescription) }
+        }
     }
 
     // Wait only for a pending capture/apply, not as an idle network timer.
@@ -1732,6 +1794,8 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         catch { studyGraphs = []; failure(error) }
         do { studyVisuals = try visualStore.load(book: bookID, page: page.id, availableSources: visualSources()) }
         catch { studyVisuals = []; failure(error) }
+        do { studyAnswers = try answerStore.load(book: bookID, page: page.id) }
+        catch { studyAnswers = []; failure(error) }
         for child in [paper, aiObjects, canvas, graphOverlay] {
             child.translatesAutoresizingMaskIntoConstraints = false
             NSLayoutConstraint.activate([
@@ -1746,10 +1810,12 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         let objects = store.objects(book: bookID, page: page)
         pageInkSize = CGSize(width: max(bounds.isNull ? 0 : bounds.maxX, CGFloat(objects.map { $0.frame.x + $0.frame.width }.max() ?? 0),
                                       CGFloat(studyGraphs.map { $0.x + Double(StudyGraphCard.cardSize.width) }.max() ?? 0),
-                                      CGFloat(studyVisuals.map { $0.x * max(0, Double(documentPageSize.width) - $0.width) + $0.width }.max() ?? 0)),
+                                      CGFloat(studyVisuals.map { $0.x * max(0, Double(documentPageSize.width) - $0.width) + $0.width }.max() ?? 0),
+                                      CGFloat(studyAnswers.map { $0.x + Double(StudyAnswerCard.cardSize.width) }.max() ?? 0)), 
                              height: max(bounds.isNull ? 0 : bounds.maxY, CGFloat(objects.map { $0.frame.y + $0.frame.height }.max() ?? 0),
                                          CGFloat(studyGraphs.map { $0.y + Double(StudyGraphCard.cardSize.height) }.max() ?? 0),
-                                         CGFloat(studyVisuals.map { $0.y * max(0, Double(documentPageSize.height) - $0.height) + $0.height }.max() ?? 0)))
+                                         CGFloat(studyVisuals.map { $0.y * max(0, Double(documentPageSize.height) - $0.height) + $0.height }.max() ?? 0),
+                                         CGFloat(studyAnswers.map { $0.y + Double(StudyAnswerCard.cardSize.height) }.max() ?? 0)))
         reloadStudyGraphCards()
         setDrawing(drawing)
         applyTool()
@@ -1822,6 +1888,42 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
             card.onRemove = { [weak self] id in self?.confirmVisualRemoval(id) }
             graphOverlay.addSubview(card)
         }
+        for note in studyAnswers {
+            let card = StudyAnswerCard(pageSize: documentPageSize,
+                origin: CGPoint(x: note.x, y: note.y), saved: note)
+            card.onClose = { [weak self] in self?.confirmAnswerRemoval(note.id) }
+            card.onKeep = { [weak self] _, origin in self?.moveSavedAnswer(note.id, to: origin) }
+            graphOverlay.addSubview(card)
+        }
+        if let preview = studyAnswerPreview { graphOverlay.addSubview(preview) }
+    }
+
+    private func moveSavedAnswer(_ id: UUID, to origin: CGPoint) {
+        guard let book = bookID, let page = pageID,
+              let index = studyAnswers.firstIndex(where: { $0.id == id }) else { return }
+        var updated = studyAnswers
+        updated[index].x = Double(origin.x)
+        updated[index].y = Double(origin.y)
+        do { try answerStore.save(updated, book: book, page: page); studyAnswers = updated }
+        catch { failure(error); reloadStudyGraphCards() }
+    }
+
+    private func confirmAnswerRemoval(_ id: UUID) {
+        guard let book = bookID, let page = pageID,
+              studyAnswers.contains(where: { $0.id == id }), presentedViewController == nil else { return }
+        let alert = UIAlertController(title: "Remove saved AI answer?",
+            message: "The purple handwriting and other notes stay unchanged.", preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "Keep", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Remove answer", style: .destructive) { [weak self] _ in
+            guard let self, self.bookID == book, self.pageID == page else { return }
+            let updated = self.studyAnswers.filter { $0.id != id }
+            do {
+                try self.answerStore.save(updated, book: book, page: page)
+                self.studyAnswers = updated
+                self.reloadStudyGraphCards()
+            } catch { self.failure(error) }
+        })
+        present(alert, animated: true)
     }
 
     private func visualSources() throws -> Set<UUID> { Set(try referenceStore.all().map(\.id)) }
