@@ -94,6 +94,9 @@ final class StudyReferenceStore {
         let known = Set(folders.map(\.id))
         return try all().filter { resource in
             if pinnedIDs.contains(resource.id) { return true }
+            // Root/Unassigned has no implicit AI scope. Historical PDFs may
+            // belong to an earlier semester: require moving or explicit pinning.
+            guard let folderID, known.contains(folderID) else { return false }
             let assigned = resource.folderID.flatMap { known.contains($0) ? $0 : nil }
             // A removed folder is browsable as Unassigned but must not become
             // automatically eligible for an unrelated root notebook.
