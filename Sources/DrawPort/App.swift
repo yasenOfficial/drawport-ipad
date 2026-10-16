@@ -1215,7 +1215,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
                     } catch {
                         try checkForeground(generation)
                         // Preparation precedes upload/submission. A recovered ID
-                        // may never have reached DGX; keep its exact explicit retry.
+                        // may never have reached the service; keep its exact explicit retry.
                         if recovering, case AIClientError.server(404, _) = error { return }
                         throw error
                     }
