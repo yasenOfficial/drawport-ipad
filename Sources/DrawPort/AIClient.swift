@@ -233,7 +233,7 @@ final class AIClient {
         guard (200...299).contains(http.statusCode) else {
             struct Failure: Decodable { var error: AIServiceError }
             let message = (try? JSONDecoder().decode(Failure.self, from: data))?.error.message
-                ?? "DGX could not complete the AI request (HTTP \(http.statusCode)). Your notes are safe."
+                ?? "The AI service could not complete this request (HTTP \(http.statusCode)). Your notes are safe."
             throw AIClientError.server(http.statusCode, message)
         }
         if let digest {

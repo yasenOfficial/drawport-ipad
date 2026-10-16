@@ -53,7 +53,10 @@ enum ShapeSnap {
         let diagonal = hypot(width, height)
         guard diagonal > 28 else { return nil }
         let start = points[0], end = points[points.count - 1]
-        let closed = distance(start, end) < max(23, diagonal * 0.18)
+        let travel = zip(points, points.dropFirst()).reduce(CGFloat.zero) { $0 + distance($1.0, $1.1) }
+        // The Pencil may lift slightly short of its starting point. Requiring a
+        // near-complete lap also keeps ordinary open C-curves from becoming circles.
+        let closed = distance(start, end) < max(32, diagonal * 0.32) && travel > diagonal * 2.05
         let shapePoints: [CGPoint]
         if !closed {
             let deviation = points.map { segmentDistance($0, start, end) }.max() ?? 0
@@ -89,20 +92,46 @@ enum ShapeSnap {
             if vertices.count > 2 && distance(vertices[0], vertices[vertices.count - 1]) < max(23, diagonal * 0.18) {
                 vertices.removeLast()
             }
-            if vertices.count == 3 || vertices.count == 4 {
-                shapePoints = sampled(vertices, closed: true) // triangle or rectangle/square
-            } else {
-                // Many short corners around a roughly elliptical loop.
-                let center = CGPoint(x: (minX + maxX) / 2, y: (minY + maxY) / 2)
-                let radiusX = width / 2, radiusY = height / 2
-                let error = points.map { abs(hypot(($0.x - center.x) / radiusX, ($0.y - center.y) / radiusY) - 1) }
-                    .reduce(0, +) / CGFloat(points.count)
-                guard error < 0.3 else { return nil }
+            let center = CGPoint(x: (minX + maxX) / 2, y: (minY + maxY) / 2)
+            let radiusX = width / 2, radiusY = height / 2
+            let ellipseError = points.map { abs(hypot(($0.x - center.x) / radiusX, ($0.y - center.y) / radiusY) - 1) }
+                .reduce(0, +) / CGFloat(points.count)
+            let quadrants = Set(points.map { point in
+                (point.x >= center.x ? 1 : 0) + (point.y >= center.y ? 2 : 0)
+            })
+            let rectangleError = points.map { point in
+                min(abs(point.x - minX), abs(point.x - maxX), abs(point.y - minY), abs(point.y - maxY))
+            }.reduce(0, +) / CGFloat(points.count) / min(width, height)
+            if quadrants.count == 4 && travel > diagonal * 2.08 &&
+                ellipseError < (vertices.count >= 5 ? 0.24 : 0.11) && rectangleError > 0.065 {
+                // For a nearly round loop, use one radius; don't require the
+                // student to draw an already-perfect circle to get a circle.
+                let round = abs(width - height) / max(width, height) < 0.28
+                let rx = round ? (width + height) / 4 : radiusX
+                let ry = round ? rx : radiusY
+                shapePoints = (0...72).map { index in
+                    let angle = CGFloat(index) * 2 * .pi / 72
+                    return CGPoint(x: center.x + rx * cos(angle), y: center.y + ry * sin(angle))
+                }
+            } else if vertices.count >= 4 && vertices.count <= 7 && rectangleError < 0.09 {
+                // Fit shared axis-aligned corners rather than reusing four
+                // independently wobbly Pencil corners. Near-square => square.
+                let square = abs(width - height) / max(width, height) < 0.25
+                let halfWidth = square ? (width + height) / 4 : width / 2
+                let halfHeight = square ? halfWidth : height / 2
+                let box = [CGPoint(x: center.x - halfWidth, y: center.y - halfHeight),
+                           CGPoint(x: center.x + halfWidth, y: center.y - halfHeight),
+                           CGPoint(x: center.x + halfWidth, y: center.y + halfHeight),
+                           CGPoint(x: center.x - halfWidth, y: center.y + halfHeight)]
+                shapePoints = sampled(box, closed: true)
+            } else if vertices.count == 3 || vertices.count == 4 {
+                shapePoints = sampled(vertices, closed: true) // triangles and tilted quadrilaterals
+            } else if quadrants.count == 4 && ellipseError < 0.30 {
                 shapePoints = (0...72).map { index in
                     let angle = CGFloat(index) * 2 * .pi / 72
                     return CGPoint(x: center.x + radiusX * cos(angle), y: center.y + radiusY * sin(angle))
                 }
-            }
+            } else { return nil }
         }
         guard shapePoints.count >= 2 else { return nil }
         let reference = originals[0]

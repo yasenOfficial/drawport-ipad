@@ -373,11 +373,12 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         overrideUserInterfaceStyle = .dark
         view.backgroundColor = UIColor(white: 0.105, alpha: 1)
         if let saved = UserDefaults.standard.array(forKey: "customInkColors") as? [[Double]], saved.count == inkColors.count {
-            for (index, components) in saved.enumerated() where index != 7 && components.count == 3 && components.allSatisfy({ (0...1).contains($0) }) {
+            for (index, components) in saved.enumerated() where index != 0 && index != 7 && components.count == 3 && components.allSatisfy({ (0...1).contains($0) }) {
                 inkColors[index] = UIColor(red: components[0], green: components[1], blue: components[2], alpha: 1)
             }
         }
-        // Purple is semantic question/context ink, not an editable cosmetic slot.
+        // Named semantic swatches must never silently turn white via old settings.
+        inkColors[0] = .black
         inkColors[7] = QuestionInk.color
         do { aiJournal = try injectedAIJournal ?? AINetworkJournal() }
         catch { DispatchQueue.main.async { self.failure(error) } }
@@ -604,7 +605,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         clear()
         view.backgroundColor = UIColor(white: 0.105, alpha: 1)
         let head = button("plus", label: "New document") { [weak self] in self?.askName() }
-        let sync = button("arrow.triangle.2.circlepath", label: "Sync with DGX") { [weak self] in self?.syncWithServer() }
+        let sync = button("arrow.triangle.2.circlepath", label: "Cloud sync") { [weak self] in self?.syncWithServer() }
         let folder = store.folders.first { $0.id == homeFolderID }
         if folder == nil { homeFolderID = nil }
         let title = UILabel()
@@ -730,23 +731,39 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
             message: "Delete \"\(book.name)\" and its \(book.pages.count) pages? This cannot be undone in the app.",
             preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        alert.addAction(UIAlertAction(title: "Delete notebook", style: .destructive) { [weak self] _ in
-            guard let self else { return }
-            do {
-                try self.store.deleteNotebook(id)
-                self.showHome()
-            } catch {
-                DispatchQueue.main.async { [weak self] in self?.failure(error) }
-            }
+        alert.addAction(UIAlertAction(title: "Continue…", style: .destructive) { [weak self] _ in
+            guard let self, let current = self.store.notebook(id) else { return }
+            let final = UIAlertController(title: "Delete \"\(current.name)\" permanently?",
+                message: "Second confirmation: all \(current.pages.count) pages will be removed from the library. This cannot be undone in the app.",
+                preferredStyle: .alert)
+            final.addAction(UIAlertAction(title: "Keep notebook", style: .cancel))
+            final.addAction(UIAlertAction(title: "Delete permanently", style: .destructive) { [weak self] _ in
+                guard let self, self.store.notebook(id) != nil else { return }
+                do {
+                    try self.store.deleteNotebook(id)
+                    self.showHome()
+                } catch {
+                    DispatchQueue.main.async { [weak self] in self?.failure(error) }
+                }
+            })
+            self.present(final, animated: true)
         })
         present(alert, animated: true)
     }
 
     private func syncWithServer() {
         guard bookID == nil, !syncInProgress else { return }
+        if DrawEndpoints.configured("sync").host?.hasSuffix(".example.invalid") == true || DrawEndpoints.token.isEmpty {
+            let alert = UIAlertController(title: "Cloud sync unavailable",
+                message: "This build has no configured sync account. Your notes stay on this iPad; nothing was uploaded.",
+                preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "OK", style: .default))
+            present(alert, animated: true)
+            return
+        }
         syncInProgress = true
         content.isUserInteractionEnabled = false
-        syncStatus.text = "Syncing with DGX…"
+        syncStatus.text = "Syncing…"
         Task { @MainActor in
             defer { syncInProgress = false; content.isUserInteractionEnabled = true; showHome() }
             do {
@@ -789,7 +806,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
                     journal.legacyInvalidated = true
                     try journal.save(in: syncDefaults)
                     try store.completeSuccessfulSync()
-                    syncMessage = "Synced with DGX · \(Date().formatted(date: .omitted, time: .shortened))"
+                    syncMessage = "Synced · \(Date().formatted(date: .omitted, time: .shortened))"
                     return
                 }
                 throw SyncError.conflict
@@ -1386,7 +1403,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         if let onError { onError(error, title); return }
         guard viewIfLoaded?.window != nil, presentedViewController == nil else { return }
         let message = error is URLError
-            ? "Could not reach DGX. Check internet and Tailscale VPN, then retry. Your local notes are safe."
+            ? "Could not reach cloud sync. Check your connection and try again. Your local notes are safe."
             : error.localizedDescription
         let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "OK", style: .default))
@@ -1675,9 +1692,9 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         let bounds = drawing.bounds
         let objects = store.objects(book: bookID, page: page)
         pageInkSize = CGSize(width: max(bounds.isNull ? 0 : bounds.maxX, CGFloat(objects.map { $0.frame.x + $0.frame.width }.max() ?? 0),
-                                      CGFloat(studyGraphs.map { $0.x + 370 }.max() ?? 0)),
+                                      CGFloat(studyGraphs.map { $0.x + Double(StudyGraphCard.cardSize.width) }.max() ?? 0)),
                              height: max(bounds.isNull ? 0 : bounds.maxY, CGFloat(objects.map { $0.frame.y + $0.frame.height }.max() ?? 0),
-                                         CGFloat(studyGraphs.map { $0.y + 285 }.max() ?? 0)))
+                                         CGFloat(studyGraphs.map { $0.y + Double(StudyGraphCard.cardSize.height) }.max() ?? 0)))
         reloadStudyGraphCards()
         setDrawing(drawing)
         applyTool()
@@ -1764,8 +1781,8 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         let width = max(Double(viewport.surface.bounds.width), Double(documentPageSize.width))
         let height = max(Double(viewport.surface.bounds.height), Double(documentPageSize.height))
         let graph = StudyGraph(kind: kind,
-                               x: min(80 + offset, max(0, width - 370)),
-                               y: min(110 + offset, max(0, height - 285)))
+                               x: min(80 + offset, max(0, width - Double(StudyGraphCard.cardSize.width))),
+                               y: min(110 + offset, max(0, height - Double(StudyGraphCard.cardSize.height))))
         let updated = studyGraphs + [graph]
         do {
             try graphStore.save(updated, book: book, page: page)
@@ -1940,8 +1957,10 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
     @objc private func configureInkColor(_ gesture: UILongPressGestureRecognizer) {
         guard gesture.state == .began, let button = gesture.view as? UIButton,
               inkColors.indices.contains(button.tag), presentedViewController == nil else { return }
-        if button.tag == 7 {
-            let alert = UIAlertController(title: "Context ink", message: "Purple marks questions and context for AI suggestions. Its exact shade must stay fixed so the ink remains recognizable.", preferredStyle: .alert)
+        if button.tag == 0 || button.tag == 7 {
+            let alert = UIAlertController(title: button.tag == 0 ? "Black ink" : "Context ink",
+                message: button.tag == 0 ? "Black stays black. Long-press another color to customize it." : "Purple marks questions and context for AI suggestions. Its exact shade must stay fixed so the ink remains recognizable.",
+                preferredStyle: .alert)
             alert.addAction(UIAlertAction(title: "OK", style: .default))
             present(alert, animated: true)
             return
@@ -1973,7 +1992,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
     }
 
     private func updateInkColor(index: Int, color rawColor: UIColor) {
-        guard inkColors.indices.contains(index), index != 7 else { return }
+        guard inkColors.indices.contains(index), index != 0 && index != 7 else { return }
         let color = rawColor.resolvedColor(with: traitCollection)
         var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
         guard color.getRed(&r, green: &g, blue: &b, alpha: &a) else { return }
@@ -1990,7 +2009,12 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
     }
 
     @objc private func configureStrokeWidth(_ gesture: UILongPressGestureRecognizer) {
-        guard gesture.state == .began, let source = gesture.view, presentedViewController == nil else { return }
+        guard gesture.state == .began, let source = gesture.view else { return }
+        presentStrokeWidth(from: source)
+    }
+
+    private func presentStrokeWidth(from source: UIView) {
+        guard presentedViewController == nil else { return }
         let isMarker = source.tag == 2
         let choices = isMarker ? markerWidths : widths
         let picker = StrokeWidthController(name: isMarker ? "Highlighter" : (source.accessibilityIdentifier == "shapeMode" ? "Shapes" : "Pen"),
@@ -2050,7 +2074,14 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         var controls: [UIView] = []
         for i in symbols.indices {
             let action = i >= 6 ? i + 1 : i // Keep action IDs stable after removing the persistent eraser.
-            let b = button(symbols[i], label: names[i]) { [weak self] in self?.toolbarAction(action) }
+            let b = button(symbols[i], label: names[i]) { [weak self] in
+                guard let self else { return }
+                let samePen = i == 5 && self.currentTool == 0 && !self.shapeModeEnabled
+                let sameMarker = i == 7 && self.currentTool == 2
+                if !self.quickArmed && (samePen || sameMarker) && self.buttons.indices.contains(i) {
+                    self.presentStrokeWidth(from: self.buttons[i])
+                } else { self.toolbarAction(action) }
+            }
             // Page navigation and paper templates live outside the pen strip.
             if i <= 4 { b.isHidden = true } // Page navigation/overview appear once, in the top bar.
             if i == 8 { b.isHidden = !controlVisible("showSelectionControl") }
@@ -2062,9 +2093,6 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
                 b.addGestureRecognizer(hold)
             } else if i == 5 || i == 7 {
                 b.tag = i == 7 ? 2 : 0
-                let hold = UILongPressGestureRecognizer(target: self, action: #selector(configureStrokeWidth(_:)))
-                hold.minimumPressDuration = 0.45
-                b.addGestureRecognizer(hold)
             }
             controls.append(b)
             buttons.append(b)

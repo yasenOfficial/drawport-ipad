@@ -105,11 +105,11 @@ enum SyncError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .missingToken: return "This build has no DGX sync credential. Notes remain on this iPad."
+        case .missingToken: return "Cloud sync is not configured. Notes remain on this iPad."
         case .invalidPackage: return "The sync package could not be verified. No local document was replaced."
         case .conflict: return "Both copies have changed. Sync stopped without overwriting either copy."
         case .tooLarge: return "A sync object or its metadata exceeds the transfer size limit. Notes remain on this iPad."
-        case .http(let status): return "DGX rejected sync (HTTP \(status)). No success was confirmed."
+        case .http(let status): return "Cloud sync rejected the request (HTTP \(status)). No success was confirmed."
         }
     }
 }

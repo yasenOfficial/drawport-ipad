@@ -140,6 +140,7 @@ private final class StudyGraphPlot: UIView {
 }
 
 final class StudyGraphCard: UIView {
+    static let cardSize = CGSize(width: 500, height: 400)
     private(set) var graph: StudyGraph
     var onCommit: ((StudyGraph) -> Void)?
     var onRemove: ((UUID) -> Void)?
@@ -152,7 +153,7 @@ final class StudyGraphCard: UIView {
 
     init(graph: StudyGraph) {
         self.graph = graph
-        super.init(frame: CGRect(x: graph.x, y: graph.y, width: 370, height: 285))
+        super.init(frame: CGRect(origin: CGPoint(x: graph.x, y: graph.y), size: Self.cardSize))
         backgroundColor = UIColor(red: 1, green: 0.995, blue: 0.956, alpha: 1)
         layer.cornerRadius = 13
         layer.borderColor = UIColor(white: 0.76, alpha: 1).cgColor
