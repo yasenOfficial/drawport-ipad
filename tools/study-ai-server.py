@@ -153,7 +153,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                       "be read. Never claim to have read a whole notebook or PDF. No tools, no invented sources. "
                       "Answer concisely in plain text without Markdown or asterisks.")
             content = question if image is None else [
-                {"type": "text", "text": "Това е изрязано изображение САМО на мастилото вътре в лилаво заграждение; самата лилава линия е премахната нарочно. Не обсъждай липсата на рамка. Прочети видимия текст, провери решението или обясни задачата кратко НА БЪЛГАРСКИ. При нечетлив почерк кажи го."},
+                {"type": "text", "text": "Това е изрязано изображение с мастилото вътре в лилаво заграждение И евентуални лилави ръкописни указания отстрани. Самата линия на заграждението е премахната нарочно; не я обсъждай. Считай лилавия текст отстрани за въпрос/контекст към ограденото. Прочети видимото, провери решението или обясни задачата кратко НА БЪЛГАРСКИ. При нечетлив почерк кажи го."},
                 {"type": "image_url", "image_url": {"url": "data:image/png;base64," + image}}]
             payload = {"model": MODEL, "messages": [
                 {"role": "system", "content": system},

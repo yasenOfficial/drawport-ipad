@@ -20,7 +20,7 @@ enum StudyAIConfiguration {
 private struct StudyQuestion: Encodable {
     let version = 1
     let question: String?
-    let image: String? // Only the explicitly circled, bounded PNG crop.
+    let image: String? // Polygon-clipped crop plus adjacent purple side-notes.
 }
 private struct StudyStreamEvent: Decodable { let delta: String?; let error: String?; let done: Bool? }
 
@@ -39,10 +39,10 @@ enum StudyAIError: LocalizedError {
 
 struct StudyPurpleContext {
     let recognizedText: String? // Purple writing without an enclosure: local OCR.
-    let imagePNG: Data?        // Enclosed page ink: only the interior crop.
+    let imagePNG: Data?        // Enclosed ink + adjacent purple handwritten prompt.
     let sourceHash: String
     let bounds: CGRect
-    let purpleStrokeIndices: [Int] // Only these marks disappear after Keep.
+    let purpleStrokeIndices: [Int] // Only these marks hide after Keep or Reject.
 }
 
 /// A closed purple loop selects strokes by the actual polygon, NOT the whole
@@ -107,8 +107,9 @@ private enum StudyInkEnclosure {
 }
 
 /// Purple *writing* is locally OCR'd into text. A purple *enclosure* instead
-/// chooses the actual ink inside it (any ink color) and offers an image preview
-/// on the page. Only that cropped image is sent after an explicit Send tap.
+/// chooses the actual ink inside it (any ink color) PLUS purple notes beside
+/// the loop. Other-color ink outside stays excluded. Only the bounded, visible
+/// composite is sent after an explicit Send tap.
 enum StudyPurpleCapture {
     @MainActor static func recognize(_ drawing: PKDrawing) async throws -> StudyPurpleContext {
         let purpleStrokes = drawing.strokes.filter { QuestionInk.matches($0.ink.color) }
@@ -119,10 +120,29 @@ enum StudyPurpleCapture {
             guard !selectedIndices.isEmpty else { throw StudyAIError.noContent }
             guard selectedIndices.count <= 1_200 else { throw StudyAIError.tooMuchInk }
             let selected = selectedIndices.map { drawing.strokes[$0] }
-            let crop = loop.bounds.insetBy(dx: -12, dy: -12).integral
+            let selectedSet = Set(selectedIndices)
+            // Side notes may sit at the opposite edge of an 11-inch iPad page.
+            // The resulting union still has a strict image/byte budget and is
+            // shown exactly in the on-page preview before any upload.
+            let nearby = loop.bounds.insetBy(dx: -550, dy: -280)
+            let adjacentIndices = drawing.strokes.indices.filter { index in
+                guard index != loop.index, !selectedSet.contains(index),
+                      QuestionInk.matches(drawing.strokes[index].ink.color),
+                      drawing.strokes[index].renderBounds.intersects(nearby),
+                      !StudyInkEnclosure.contains(CGPoint(x: drawing.strokes[index].renderBounds.midX,
+                                                         y: drawing.strokes[index].renderBounds.midY),
+                                                  vertices: loop.vertices),
+                      StudyInkEnclosure.find(in: PKDrawing(strokes: [drawing.strokes[index]])) == nil else {
+                    return false
+                }
+                return true
+            }
+            let adjacent = PKDrawing(strokes: adjacentIndices.map { drawing.strokes[$0] })
+            let extent = adjacentIndices.isEmpty ? loop.bounds : loop.bounds.union(adjacent.bounds)
+            let crop = extent.insetBy(dx: -12, dy: -12).integral
             guard crop.width > 10, crop.height > 10,
-                  crop.width <= 1_200, crop.height <= 1_200,
-                  crop.width * crop.height <= 1_000_000 else { throw StudyAIError.tooMuchInk }
+                  crop.width <= 1_600, crop.height <= 1_200,
+                  crop.width * crop.height <= 1_500_000 else { throw StudyAIError.tooMuchInk }
             let pixels = PKDrawing(strokes: selected)
             let format = UIGraphicsImageRendererFormat()
             format.scale = min(1.5, 1_024 / max(crop.width, crop.height))
@@ -137,6 +157,10 @@ enum StudyPurpleCapture {
                 renderer.cgContext.clip()
                 pixels.image(from: crop, scale: format.scale).draw(in: CGRect(origin: .zero, size: crop.size))
                 renderer.cgContext.restoreGState()
+                if !adjacentIndices.isEmpty {
+                    adjacent.image(from: crop, scale: format.scale)
+                        .draw(in: CGRect(origin: .zero, size: crop.size))
+                }
             }
             guard let png = image.pngData(), !png.isEmpty, png.count <= 180_000 else {
                 throw StudyAIError.tooMuchInk
@@ -146,7 +170,7 @@ enum StudyPurpleCapture {
             let hash = SHA256.hash(data: png + Data(position.utf8)).map { String(format: "%02x", $0) }.joined()
             let purpleIndices = [loop.index] + selectedIndices.filter {
                 QuestionInk.matches(drawing.strokes[$0].ink.color)
-            }
+            } + adjacentIndices
             return StudyPurpleContext(recognizedText: nil, imagePNG: png, sourceHash: hash,
                                       bounds: loop.bounds, purpleStrokeIndices: purpleIndices)
         }

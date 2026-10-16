@@ -350,6 +350,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
     private lazy var graphStore = StudyGraphStore(root: store.fileRoot)
     private lazy var visualStore = StudyVisualStore(root: store.fileRoot)
     private lazy var answerStore = StudyAnswerStore(root: store.fileRoot)
+    private lazy var promptArchiveStore = StudyPromptArchiveStore(root: store.fileRoot)
     private lazy var referenceStore = StudyReferenceStore(root: store.fileRoot)
     private var studyGraphs: [StudyGraph] = []
     private var studyVisuals: [StudyVisualAsset] = []
@@ -1263,6 +1264,14 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
                 guard self.bookID == book, self.pageID == page,
                       self.studyAnswerPreview === card else { return }
                 card.finishAnswer()
+                card.onClose = { [weak self, weak card] in
+                    guard let self, let card else { return }
+                    self.rejectPurpleAnswer(context, card: card, book: book, page: page)
+                }
+                card.onSend = { [weak self, weak card] in
+                    guard let self, let card else { return }
+                    self.rejectPurpleAnswer(context, card: card, book: book, page: page)
+                }
                 card.onKeep = { [weak self, weak card] text, origin in
                     guard let self, let card else { return }
                     self.keepPurpleAnswer(context, text: text, origin: origin,
@@ -1281,41 +1290,24 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         guard bookID == book, pageID == page, studyAnswerPreview === card,
               studyAnswers.count < 8, card.onKeep != nil else { return }
         card.onKeep = nil
+        card.onSend = nil
         card.showStatus("Keeping answer and hiding the purple selection…")
         studyAnswerTask?.cancel()
         studyAnswerTask = Task { @MainActor [weak self, weak card] in
             guard let self, let card else { return }
             do {
-                let latest = try await StudyPurpleCapture.recognize(self.canvas.drawing)
-                try Task.checkCancellation()
-                guard self.bookID == book, self.pageID == page, self.studyAnswerPreview === card,
-                      latest.sourceHash == context.sourceHash,
-                      latest.purpleStrokeIndices.count > 0 else { throw StudyAIError.unreadable }
-                try self.saveCanvasIfChanged()
-                let strokes = self.canvas.drawing.strokes
-                let indices = Set(latest.purpleStrokeIndices)
-                guard indices.count == latest.purpleStrokeIndices.count,
-                      indices.allSatisfy({ strokes.indices.contains($0) && QuestionInk.matches(strokes[$0].ink.color) }) else {
-                    throw StudyAIError.unreadable
-                }
-                let archive = PKDrawing(strokes: strokes.enumerated().compactMap {
-                    indices.contains($0.offset) ? $0.element : nil
-                }).dataRepresentation()
-                guard !archive.isEmpty, archive.count <= 1_000_000 else { throw StudyAIError.tooMuchInk }
+                let prepared = try await self.preparePromptRemoval(context, card: card, book: book, page: page)
                 let note = StudyAnswerNote(id: UUID(), sourceSHA256: context.sourceHash,
                     recognizedQuestion: context.recognizedText ?? "Circled ink image", answer: text,
-                    hiddenPurpleInk: archive, x: Double(origin.x), y: Double(origin.y))
+                    hiddenPurpleInk: prepared.archive, x: Double(origin.x), y: Double(origin.y))
                 let previous = self.studyAnswers
                 try self.answerStore.save(previous + [note], book: book, page: page)
-                let reduced = PKDrawing(strokes: strokes.enumerated().compactMap {
-                    indices.contains($0.offset) ? nil : $0.element
-                })
-                do { try self.store.commit(book: book, page: page, drawing: reduced) }
+                do { try self.store.commit(book: book, page: page, drawing: prepared.reduced) }
                 catch {
                     try? self.answerStore.save(previous, book: book, page: page)
                     throw error
                 }
-                self.setDrawing(reduced)
+                self.setDrawing(prepared.reduced)
                 self.studyAnswers.append(note)
                 self.studyAnswerPreview = nil
                 card.markSaved()
@@ -1328,6 +1320,81 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
                     guard let self, let card else { return }
                     self.keepPurpleAnswer(context, text: value, origin: position,
                                           card: card, book: book, page: page)
+                }
+                card.onSend = { [weak self, weak card] in
+                    guard let self, let card else { return }
+                    self.rejectPurpleAnswer(context, card: card, book: book, page: page)
+                }
+            }
+        }
+    }
+
+    private func preparePromptRemoval(_ context: StudyPurpleContext, card: StudyAnswerCard,
+                                      book: UUID, page: UUID) async throws -> (archive: Data, reduced: PKDrawing) {
+        let latest = try await StudyPurpleCapture.recognize(canvas.drawing)
+        try Task.checkCancellation()
+        guard bookID == book, pageID == page, studyAnswerPreview === card,
+              latest.sourceHash == context.sourceHash,
+              latest.purpleStrokeIndices.count > 0 else { throw StudyAIError.unreadable }
+        try saveCanvasIfChanged()
+        let strokes = canvas.drawing.strokes
+        let indices = Set(latest.purpleStrokeIndices)
+        guard indices.count == latest.purpleStrokeIndices.count,
+              indices.allSatisfy({ strokes.indices.contains($0) && QuestionInk.matches(strokes[$0].ink.color) }) else {
+            throw StudyAIError.unreadable
+        }
+        let archive = PKDrawing(strokes: strokes.enumerated().compactMap {
+            indices.contains($0.offset) ? $0.element : nil
+        }).dataRepresentation()
+        guard !archive.isEmpty, archive.count <= 1_000_000 else { throw StudyAIError.tooMuchInk }
+        let reduced = PKDrawing(strokes: strokes.enumerated().compactMap {
+            indices.contains($0.offset) ? nil : $0.element
+        })
+        return (archive, reduced)
+    }
+
+    /// Reject a COMPLETED response. Keep no answer, but archive and hide the
+    /// purple prompt. Earlier preview cancellation or network failure keeps ink.
+    private func rejectPurpleAnswer(_ context: StudyPurpleContext, card: StudyAnswerCard,
+                                    book: UUID, page: UUID) {
+        guard bookID == book, pageID == page, studyAnswerPreview === card,
+              card.onClose != nil else { return }
+        card.onClose = nil
+        card.onKeep = nil
+        card.onSend = nil
+        card.showStatus("Discarding answer and hiding used purple ink…")
+        studyAnswerTask?.cancel()
+        studyAnswerTask = Task { @MainActor [weak self, weak card] in
+            guard let self, let card else { return }
+            do {
+                let prepared = try await self.preparePromptRemoval(context, card: card, book: book, page: page)
+                let record = StudyPromptArchive(id: UUID(), sourceSHA256: context.sourceHash,
+                                                ink: prepared.archive, created: Date())
+                let prior = try self.promptArchiveStore.load(book: book, page: page)
+                try self.promptArchiveStore.save(prior + [record], book: book, page: page)
+                do { try self.store.commit(book: book, page: page, drawing: prepared.reduced) }
+                catch {
+                    try? self.promptArchiveStore.save(prior, book: book, page: page)
+                    throw error
+                }
+                self.setDrawing(prepared.reduced)
+                self.studyAnswerPreview = nil
+                card.removeFromSuperview()
+            } catch is CancellationError { return }
+            catch {
+                card.showSaveFailure("Could not discard safely: " + error.localizedDescription)
+                card.onClose = { [weak self, weak card] in
+                    guard let self, let card else { return }
+                    self.rejectPurpleAnswer(context, card: card, book: book, page: page)
+                }
+                card.onKeep = { [weak self, weak card] text, origin in
+                    guard let self, let card else { return }
+                    self.keepPurpleAnswer(context, text: text, origin: origin,
+                                          card: card, book: book, page: page)
+                }
+                card.onSend = { [weak self, weak card] in
+                    guard let self, let card else { return }
+                    self.rejectPurpleAnswer(context, card: card, book: book, page: page)
                 }
             }
         }
@@ -1792,6 +1859,9 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
             UIAction(title: "Study references", image: UIImage(systemName: "books.vertical")) { [weak self] _ in
                 self?.showStudyReferences()
             },
+            UIAction(title: "Restore last purple prompt", image: UIImage(systemName: "arrow.uturn.backward")) { [weak self] _ in
+                self?.restoreLastPurplePrompt()
+            },
             UIAction(title: "Settings", image: UIImage(systemName: "gearshape")) { [weak self] _ in
                 self?.finishSave()
                 self?.showSettings()
@@ -1988,6 +2058,40 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
                 self.studyAnswers = updated
                 self.reloadStudyGraphCards()
             } catch { self.failure(error) }
+        })
+        present(alert, animated: true)
+    }
+
+    private func restoreLastPurplePrompt() {
+        guard let book = bookID, let page = pageID, presentedViewController == nil else { return }
+        let records: [StudyPromptArchive]
+        do { records = try promptArchiveStore.load(book: book, page: page) }
+        catch { failure(error); return }
+        guard let last = records.last else {
+            let notice = UIAlertController(title: "No rejected purple prompt",
+                message: "No archived prompt ink exists for this page.", preferredStyle: .alert)
+            notice.addAction(UIAlertAction(title: "OK", style: .default))
+            present(notice, animated: true)
+            return
+        }
+        let alert = UIAlertController(title: "Restore purple prompt?",
+            message: "Restore the last rejected prompt's original purple strokes on this page.",
+            preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Restore", style: .default) { [weak self] _ in
+            guard let self, self.bookID == book, self.pageID == page else { return }
+            do {
+                try self.saveCanvasIfChanged()
+                let archived = try PKDrawing(data: last.ink)
+                let existing = Set(self.canvas.drawing.strokes.map { $0.path.creationDate })
+                let missing = archived.strokes.filter { !existing.contains($0.path.creationDate) }
+                if !missing.isEmpty {
+                    let restored = PKDrawing(strokes: self.canvas.drawing.strokes + missing)
+                    try self.store.commit(book: book, page: page, drawing: restored)
+                    self.setDrawing(restored)
+                }
+                try self.promptArchiveStore.save(records.filter { $0.id != last.id }, book: book, page: page)
+            } catch { DispatchQueue.main.async { [weak self] in self?.failure(error) } }
         })
         present(alert, animated: true)
     }

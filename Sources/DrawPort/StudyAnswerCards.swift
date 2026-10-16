@@ -70,6 +70,59 @@ final class StudyAnswerStore {
     }
 }
 
+/// Rejected answers also hide the used purple prompt, but its native strokes
+/// stay in an atomic private archive for explicit Restore from Notebook options.
+struct StudyPromptArchive: Codable {
+    var id: UUID
+    var sourceSHA256: String
+    var ink: Data
+    var created: Date
+    func validate() throws {
+        guard sourceSHA256.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
+              (1...1_000_000).contains(ink.count),
+              let drawing = try? PKDrawing(data: ink),
+              !drawing.strokes.isEmpty, drawing.strokes.count <= 1_200,
+              drawing.strokes.allSatisfy({ QuestionInk.matches($0.ink.color) }) else { throw StudyAIError.server }
+    }
+}
+
+final class StudyPromptArchiveStore {
+    private struct Document: Codable {
+        var version: Int
+        var notebook: UUID
+        var page: UUID
+        var records: [StudyPromptArchive]
+    }
+    private let root: URL
+    init(root: URL) { self.root = root.appendingPathComponent("StudyPromptArchives", isDirectory: true) }
+    private func path(book: UUID, page: UUID) -> URL {
+        root.appendingPathComponent(book.uuidString, isDirectory: true)
+            .appendingPathComponent(page.uuidString + ".json")
+    }
+    func load(book: UUID, page: UUID) throws -> [StudyPromptArchive] {
+        let file = path(book: book, page: page)
+        guard FileManager.default.fileExists(atPath: file.path) else { return [] }
+        let bytes = try Data(contentsOf: file)
+        guard bytes.count <= 8_000_000 else { throw StudyAIError.server }
+        let value = try JSONDecoder().decode(Document.self, from: bytes)
+        guard value.version == 1, value.notebook == book, value.page == page,
+              value.records.count <= 16,
+              Set(value.records.map(\.id)).count == value.records.count else { throw StudyAIError.server }
+        try value.records.forEach { try $0.validate() }
+        return value.records
+    }
+    func save(_ records: [StudyPromptArchive], book: UUID, page: UUID) throws {
+        guard records.count <= 16, Set(records.map(\.id)).count == records.count else { throw StudyAIError.server }
+        try records.forEach { try $0.validate() }
+        _ = try load(book: book, page: page) // Do not overwrite corruption.
+        let bytes = try JSONEncoder().encode(Document(version: 1, notebook: book, page: page, records: records))
+        guard bytes.count <= 8_000_000 else { throw StudyAIError.server }
+        let file = path(book: book, page: page)
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try bytes.write(to: file, options: .atomic)
+    }
+}
+
 /// A sheet-like card ON the paper: OCR preview, streaming answer and Keep on
 /// page all happen in the notebook coordinate system, not in a modal window.
 final class StudyAnswerCard: UIView {
@@ -125,7 +178,7 @@ final class StudyAnswerCard: UIView {
         previewImage.contentMode = .scaleAspectFit
         previewImage.backgroundColor = .white
         previewImage.isHidden = true
-        previewImage.accessibilityLabel = "Preview of ink inside the purple circle"
+        previewImage.accessibilityLabel = "Preview of circled ink and nearby purple notes"
         sendButton.setTitle("Send recognized purple text", for: .normal)
         sendButton.addAction(UIAction { [weak self] _ in self?.onSend?() }, for: .touchUpInside)
         keepButton.setTitle("Keep answer on page", for: .normal)
@@ -175,7 +228,7 @@ final class StudyAnswerCard: UIView {
         keepButton.isHidden = true
     }
     func showEnclosurePreview(_ png: Data) {
-        status.text = "Only this circled image goes to the free vision model. Check it first."
+        status.text = "Circled ink + nearby purple notes. Only this preview is sent."
         previewImage.image = UIImage(data: png)
         previewImage.isHidden = false
         text.isHidden = true
@@ -195,11 +248,15 @@ final class StudyAnswerCard: UIView {
         text.text = response
     }
     func finishAnswer() {
-        status.text = "Preview only · Keep to save on this page; otherwise ✕ discards it."
+        status.text = "Keep or Reject the answer. Both hide used purple ink."
+        sendButton.setTitle("Reject answer", for: .normal)
+        sendButton.isHidden = false
         keepButton.isHidden = false
+        closeButton.accessibilityLabel = "Reject answer and hide purple ink"
     }
     func showSaveFailure(_ message: String) {
         status.text = String(message.prefix(140))
+        sendButton.isHidden = false
         keepButton.isHidden = false
     }
     func markSaved() {
