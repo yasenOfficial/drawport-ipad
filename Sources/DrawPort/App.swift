@@ -1121,6 +1121,10 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
     }
 
     private func askAI() {
+        if let endpoint = StudyAIConfiguration.endpoint {
+            askStudyQuestion(endpoint: endpoint)
+            return
+        }
         let endpoint = DrawEndpoints.configured("ai")
         if endpoint.host?.hasSuffix(".example.invalid") == true || DrawEndpoints.token.isEmpty {
             let alert = UIAlertController(title: "AI suggestions need a server",
@@ -1182,6 +1186,37 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
             }
         }
         aiOperations[id] = (operationID, operation)
+    }
+
+    /// Typed-question first: no legacy full-notebook capture/upload is used by
+    /// the private OpenRouter proxy. Only the exact confirmed text is sent.
+    private func askStudyQuestion(endpoint: URL) {
+        guard bookID != nil, pageID != nil, presentedViewController == nil else { return }
+        let prompt = UIAlertController(title: "Ask Study AI", message: "Type a question. No handwritten notes, pages or PDFs are included.", preferredStyle: .alert)
+        prompt.addTextField { field in
+            field.placeholder = "Your question"
+            field.autocorrectionType = .yes
+            field.accessibilityIdentifier = "studyAI.question"
+        }
+        prompt.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        prompt.addAction(UIAlertAction(title: "Continue…", style: .default) { [weak self, weak prompt] _ in
+            guard let self, let question = prompt?.textFields?.first?.text?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !question.isEmpty, question.count <= 700 else { return }
+            let confirmation = UIAlertController(title: "Send this question?",
+                message: "Only this text goes to the private study proxy and its OpenRouter free-model provider:\n\n\(question)",
+                preferredStyle: .alert)
+            confirmation.addAction(UIAlertAction(title: "Keep private", style: .cancel))
+            confirmation.addAction(UIAlertAction(title: "Send question", style: .default) { [weak self] _ in
+                guard let self else { return }
+                let answer = StudyAIAnswerController(endpoint: endpoint, question: question)
+                let navigation = UINavigationController(rootViewController: answer)
+                navigation.modalPresentationStyle = .pageSheet
+                self.present(navigation, animated: true)
+            })
+            self.present(confirmation, animated: true)
+        })
+        present(prompt, animated: true)
     }
 
     // Wait only for a pending capture/apply, not as an idle network timer.
