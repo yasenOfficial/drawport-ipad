@@ -18,11 +18,18 @@ enum StudyAIConfiguration {
 }
 
 private struct StudyQuestion: Encodable {
-    let version = 1
+    let version = 2
     let question: String?
     let image: String? // Polygon-clipped crop plus adjacent purple side-notes.
+    let requestID: UUID
+    let contextHash: String
 }
-private struct StudyStreamEvent: Decodable { let delta: String?; let error: String?; let done: Bool? }
+private struct StudyStreamEvent: Decodable {
+    let delta: String?
+    let visualJSON: String?
+    let error: String?
+    let done: Bool?
+}
 
 enum StudyAIError: LocalizedError {
     case noPurpleInk, noContent, tooMuchInk, unreadable, server
@@ -218,17 +225,19 @@ enum StudyPurpleCapture {
     }
 }
 
-/// Bounded stream: plain OCR text OR the exact cropped PNG from an explicit
-/// purple enclosure. Never a full page, notebook, PDF or automatic graph.
+/// Bounded stream: OCR text OR the exact cropped preview PNG. Optional graph
+/// is declarative, validated, and remains a preview until Keep is tapped.
 enum StudyAIStream {
-    static func ask(_ context: StudyPurpleContext, endpoint: URL,
-                    onText: @escaping @MainActor (String) -> Void) async throws {
+    static func ask(_ context: StudyPurpleContext, endpoint: URL, requestID: UUID,
+                    onText: @escaping @MainActor (String) -> Void) async throws -> StudyVisualAsset? {
         let bodyData: Data
         if let image = context.imagePNG {
             guard !image.isEmpty, image.count <= 180_000 else { throw StudyAIError.tooMuchInk }
-            bodyData = try JSONEncoder().encode(StudyQuestion(question: nil, image: image.base64EncodedString()))
+            bodyData = try JSONEncoder().encode(StudyQuestion(question: nil, image: image.base64EncodedString(),
+                                                             requestID: requestID, contextHash: context.sourceHash))
         } else if let question = context.recognizedText, (1...700).contains(question.count) {
-            bodyData = try JSONEncoder().encode(StudyQuestion(question: question, image: nil))
+            bodyData = try JSONEncoder().encode(StudyQuestion(question: question, image: nil,
+                                                             requestID: requestID, contextHash: context.sourceHash))
         } else { throw StudyAIError.unreadable }
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 48
@@ -247,10 +256,12 @@ enum StudyAIStream {
               http.mimeType == "text/event-stream" else { throw StudyAIError.server }
         var total = 0
         var finished = false
+        var visual: StudyVisualAsset?
         for try await line in stream.lines {
             try Task.checkCancellation()
-            guard line.hasPrefix("data: "), let bytes = String(line.dropFirst(6)).data(using: .utf8),
-                  bytes.count <= 5_000 else { continue }
+            guard line.hasPrefix("data: ") else { continue }
+            guard let bytes = String(line.dropFirst(6)).data(using: .utf8),
+                  bytes.count <= 30_000 else { throw StudyAIError.server }
             let event = try JSONDecoder().decode(StudyStreamEvent.self, from: bytes)
             if event.error != nil { throw StudyAIError.server }
             if let delta = event.delta {
@@ -258,8 +269,19 @@ enum StudyAIStream {
                 guard total <= 4_000 else { throw StudyAIError.server }
                 await onText(delta)
             }
+            if let proposed = event.visualJSON {
+                guard visual == nil, proposed.utf8.count <= 48_000,
+                      let data = proposed.data(using: .utf8),
+                      let parsed = try? StudyVisualProposal.parse(data, requestID: requestID,
+                          contextHash: context.sourceHash, availableSources: []),
+                      parsed.assets.count == 1, parsed.assets[0].kind == .function2D else {
+                    throw StudyAIError.server
+                }
+                visual = parsed.assets[0]
+            }
             if event.done == true { finished = true; break }
         }
         guard finished, total > 0 else { throw StudyAIError.server }
+        return visual
     }
 }

@@ -10,6 +10,8 @@ import base64
 import binascii
 import http.server
 import json
+import re
+import uuid
 import os
 from pathlib import Path
 import stat
@@ -107,14 +109,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.reply(413, "Selection exceeds the request limit")
         try:
             value = json.loads(self.rfile.read(count))
-            if not isinstance(value, dict) or value.get("version") != 1:
+            if not isinstance(value, dict) or value.get("version") not in (1, 2):
                 raise ValueError()
-            if set(value) == {"version", "question"}:
+            request_id = context_hash = None
+            fields = set(value)
+            if value["version"] == 2:
+                request_id = str(uuid.UUID(value["requestID"]))
+                context_hash = value["contextHash"]
+                if not isinstance(context_hash, str) or re.fullmatch(r"[0-9a-f]{64}", context_hash) is None:
+                    raise ValueError()
+                fields -= {"requestID", "contextHash"}
+            if fields == {"version", "question"}:
                 question = value["question"]
                 if not isinstance(question, str) or not 1 <= len(question.strip()) <= 700 or "\x00" in question:
                     raise ValueError()
                 selected = (question.strip(), None)
-            elif set(value) == {"version", "image"}:
+            elif fields == {"version", "image"}:
                 encoded = value["image"]
                 if not isinstance(encoded, str) or len(encoded) > 240_000:
                     raise ValueError()
@@ -127,6 +137,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 selected = (None, encoded)
             else:
                 raise ValueError()
+            selected += (request_id, context_hash)
         except (ValueError, UnicodeError, binascii.Error, struct.error):
             return self.reply(400, "Invalid purple-ink selection")
         if not LOCK.acquire(blocking=False):
@@ -141,7 +152,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(b"data: " + data + b"\n\n")
         self.wfile.flush()
 
-    def answer(self, question, image):
+    def answer(self, question, image, request_id, context_hash):
         stream_open = False
         try:
             key = credential()
@@ -152,14 +163,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
                       "Use only the supplied text or cropped image. State uncertainty when handwriting cannot "
                       "be read. Never claim to have read a whole notebook or PDF. No tools, no invented sources. "
                       "Answer concisely in plain text without Markdown or asterisks.")
+            wants_graph = question is not None and bool(re.search(
+                r"\b(graph|plot|plotting|draw graph)\b|график|начертай|построй график",
+                question.casefold()))
+            structured = request_id is not None and (image is not None or wants_graph)
+            if structured:
+                sample = {"version": 1, "requestID": request_id, "contextHash": context_hash,
+                          "explanation": "Brief Bulgarian answer", "assets": [{
+                    "id": "00000000-0000-0000-0000-000000000002", "kind": "function2D",
+                    "caption": "y = x²", "trigger": "requested", "width": 500, "height": 340,
+                    "x": 0.1, "y": 0.2, "sourceIDs": [], "parameters": [],
+                    "plot": {"xMin": -4, "xMax": 4, "yMin": -2, "yMax": 8,
+                             "nodes": [{"op": "x", "inputs": []},
+                                       {"op": "power", "inputs": [0], "exponent": 2}], "output": 1}}]}
+                system += (" Respond ONLY with a single JSON object, schema version 1, exact requestID and contextHash. "
+                           "The explanation is your short Bulgarian study answer. assets MUST be [] for ordinary "
+                           "questions. Include ONE function2D asset only when the student explicitly asks for a "
+                           "graph or it is genuinely useful to explain a function; never draw for simple arithmetic. "
+                           "Graph expressions are a topologically ordered DAG of nodes with op x, constant(literal), "
+                           "parameter(a/b/c), add/subtract/multiply/divide(inputs two earlier indices), "
+                           "sin/cos(inputs one), power(inputs one, exponent integer 0..4). "
+                           "Only output normalized coordinates, finite values, no SVG/JS/URLs or citations. "
+                           "Use this concrete JSON schema example, but make the function fit the actual task: "
+                           + json.dumps(sample, separators=(",", ":")))
             content = question if image is None else [
                 {"type": "text", "text": "Това е изрязано изображение с мастилото вътре в лилаво заграждение И евентуални лилави ръкописни указания отстрани. Самата линия на заграждението е премахната нарочно; не я обсъждай. Считай лилавия текст отстрани за въпрос/контекст към ограденото. Прочети видимото, провери решението или обясни задачата кратко НА БЪЛГАРСКИ. При нечетлив почерк кажи го."},
                 {"type": "image_url", "image_url": {"url": "data:image/png;base64," + image}}]
             payload = {"model": MODEL, "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": content}],
-                "temperature": 0, "max_tokens": 500, "reasoning": {"effort": "none"},
+                "temperature": 0, "max_tokens": 1_800 if structured else 500,
+                "reasoning": {"effort": "none"},
                 "stream": True, "stream_options": {"include_usage": True}}
+            if structured:
+                payload["response_format"] = {"type": "json_object"}
             request = urllib.request.Request(API + "/chat/completions",
                 data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
                 headers={"Authorization": "Bearer " + key, "Content-Type": "application/json",
@@ -174,6 +211,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.close_connection = True
                 stream_open = True
                 total = 0
+                structured_parts = []
                 started = time.monotonic()
                 for line in upstream:
                     if time.monotonic() - started > 42:
@@ -193,11 +231,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         if not isinstance(delta, str) or not delta:
                             continue  # Do not relay provider reasoning or tool calls.
                         total += len(delta)
-                        if total > 4_000:
+                        if total > (12_000 if structured else 4_000):
                             self.send_event({"error": "Response limit reached"})
                             return
-                        self.send_event({"delta": delta})
-                self.send_event({"done": True} if total else {"error": "Model returned no answer"})
+                        if structured: structured_parts.append(delta)
+                        else: self.send_event({"delta": delta})
+                if structured:
+                    try:
+                        proposed = json.loads(''.join(structured_parts))
+                        if not isinstance(proposed, dict) \
+                                or not isinstance(proposed.get('explanation'), str) \
+                                or not 1 <= len(proposed['explanation']) <= 4_000 \
+                                or not isinstance(proposed.get('assets'), list) \
+                                or len(proposed['assets']) > 1:
+                            raise ValueError()
+                        self.send_event({"delta": proposed['explanation']})
+                        if proposed['assets']:
+                            proposed['version'] = 1
+                            # Model-authored binding IDs are not trusted: assign them
+                            # from the authenticated request, not from its example.
+                            proposed['requestID'] = request_id
+                            proposed['contextHash'] = context_hash
+                            for asset in proposed['assets']:
+                                if not isinstance(asset, dict): raise ValueError()
+                                asset['id'] = str(uuid.uuid4())
+                            self.send_event({"visualJSON": json.dumps(proposed, separators=(',', ':'), ensure_ascii=False)})
+                        self.send_event({"done": True})
+                    except (ValueError, KeyError, TypeError):
+                        self.send_event({"error": "No valid study graph was produced"})
+                else:
+                    self.send_event({"done": True} if total else {"error": "Model returned no answer"})
         except (BrokenPipeError, ConnectionResetError):
             pass  # User closed/cancelled the answer.
         except urllib.error.HTTPError as error:

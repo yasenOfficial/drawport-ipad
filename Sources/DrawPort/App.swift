@@ -356,6 +356,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
     private var studyVisuals: [StudyVisualAsset] = []
     private var studyAnswers: [StudyAnswerNote] = []
     private var studyAnswerPreview: StudyAnswerCard?
+    private var studyGraphPreview: StudyVisualCard?
     private var studyAnswerTask: Task<Void, Never>?
     // Explicit cross-folder references are session-only, never silently carried
     // across an app relaunch or forwarded to the unconfigured AI endpoint.
@@ -514,6 +515,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         studyAnswerTask?.cancel()
         studyAnswerTask = nil
         studyAnswerPreview = nil
+        studyGraphPreview = nil
         shapeFinalizeWork?.cancel()
         shapeFinalizeWork = nil
         shapeCandidatePage = nil
@@ -1257,13 +1259,18 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
                 guard self.bookID == book, self.pageID == page,
                       self.studyAnswerPreview === card else { return }
                 card.beginAnswer()
-                try await StudyAIStream.ask(context, endpoint: endpoint) { [weak card] delta in
+                let requestID = UUID()
+                let proposedGraph = try await StudyAIStream.ask(context, endpoint: endpoint,
+                                                                  requestID: requestID) { [weak card] delta in
                     card?.appendAnswer(delta)
                 }
                 try Task.checkCancellation()
                 guard self.bookID == book, self.pageID == page,
                       self.studyAnswerPreview === card else { return }
-                card.finishAnswer()
+                if let proposedGraph, self.studyVisuals.count < 8 {
+                    self.showStudyGraphPreview(proposedGraph, answerCard: card)
+                }
+                card.finishAnswer(hasGraph: self.studyGraphPreview != nil)
                 card.onClose = { [weak self, weak card] in
                     guard let self, let card else { return }
                     self.rejectPurpleAnswer(context, card: card, book: book, page: page)
@@ -1280,6 +1287,29 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
             } catch is CancellationError { return }
             catch { card.showStatus(error.localizedDescription) }
         }
+    }
+
+    private func showStudyGraphPreview(_ proposed: StudyVisualAsset, answerCard: StudyAnswerCard) {
+        // This card is deliberately ephemeral: no graph sidecar write before Keep.
+        var placed = proposed
+        let size = documentPageSize
+        let width = CGFloat(placed.width), height = CGFloat(placed.height)
+        let maxX = max(0, size.width - width), maxY = max(0, size.height - height)
+        let x = min(max(0, answerCard.frame.midX - width / 2), maxX)
+        let below = answerCard.frame.maxY + 16
+        let y = below <= maxY ? below : max(0, answerCard.frame.minY - height - 16)
+        placed.x = Double(x / max(1, maxX))
+        placed.y = Double(y / max(1, maxY))
+        let graph = StudyVisualCard(asset: placed, pageSize: size)
+        graph.onRemove = { [weak self, weak graph, weak answerCard] _ in
+            guard let self, let graph, self.studyGraphPreview === graph else { return }
+            graph.removeFromSuperview()
+            self.studyGraphPreview = nil
+            answerCard?.finishAnswer()
+        }
+        studyGraphPreview = graph
+        graphOverlay.addSubview(graph)
+        graphOverlay.bringSubviewToFront(answerCard)
     }
 
     /// Keep is the explicit approval to attach the answer AND hide only the
@@ -1301,10 +1331,24 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
                     recognizedQuestion: context.recognizedText ?? "Circled ink image", answer: text,
                     hiddenPurpleInk: prepared.archive, x: Double(origin.x), y: Double(origin.y))
                 let previous = self.studyAnswers
-                try self.answerStore.save(previous + [note], book: book, page: page)
+                let graph = self.studyGraphPreview?.asset
+                let previousGraphs = self.studyVisuals
+                if let graph {
+                    guard previousGraphs.count < 8 else { throw StudyVisualProtocolError.invalid }
+                    try self.visualStore.save(previousGraphs + [graph], book: book, page: page,
+                                              availableSources: self.visualSources())
+                }
+                do { try self.answerStore.save(previous + [note], book: book, page: page) }
+                catch {
+                    if graph != nil { try? self.visualStore.save(previousGraphs, book: book, page: page,
+                                                                 availableSources: self.visualSources()) }
+                    throw error
+                }
                 do { try self.store.commit(book: book, page: page, drawing: prepared.reduced) }
                 catch {
                     try? self.answerStore.save(previous, book: book, page: page)
+                    if graph != nil { try? self.visualStore.save(previousGraphs, book: book, page: page,
+                                                                 availableSources: self.visualSources()) }
                     throw error
                 }
                 self.setDrawing(prepared.reduced)
@@ -1313,6 +1357,11 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
                 card.markSaved()
                 card.onClose = { [weak self] in self?.confirmAnswerRemoval(note.id) }
                 card.onKeep = { [weak self] _, position in self?.moveSavedAnswer(note.id, to: position) }
+                if let graph {
+                    self.studyVisuals.append(graph)
+                    self.studyGraphPreview = nil
+                    self.reloadStudyGraphCards()
+                }
             } catch is CancellationError { return }
             catch {
                 card.showSaveFailure("Could not keep: " + error.localizedDescription)
@@ -1379,6 +1428,8 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
                 }
                 self.setDrawing(prepared.reduced)
                 self.studyAnswerPreview = nil
+                self.studyGraphPreview?.removeFromSuperview()
+                self.studyGraphPreview = nil
                 card.removeFromSuperview()
             } catch is CancellationError { return }
             catch {
@@ -2017,6 +2068,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
             card.onKeep = { [weak self] _, origin in self?.moveSavedAnswer(note.id, to: origin) }
             graphOverlay.addSubview(card)
         }
+        if let graph = studyGraphPreview { graphOverlay.addSubview(graph) }
         if let preview = studyAnswerPreview { graphOverlay.addSubview(preview) }
     }
 

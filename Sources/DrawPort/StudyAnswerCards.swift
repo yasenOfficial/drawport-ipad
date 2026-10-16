@@ -247,8 +247,9 @@ final class StudyAnswerCard: UIView {
         response += delta
         text.text = response
     }
-    func finishAnswer() {
-        status.text = "Keep or Reject the answer. Both hide used purple ink."
+    func finishAnswer(hasGraph: Bool = false) {
+        status.text = hasGraph ? "Graph preview: Keep saves it with the answer; Reject discards both."
+                               : "Keep or Reject the answer. Both hide used purple ink."
         sendButton.setTitle("Reject answer", for: .normal)
         sendButton.isHidden = false
         keepButton.isHidden = false
