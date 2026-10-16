@@ -96,9 +96,11 @@ private enum StudyInkEnclosure {
             let samples = Swift.stride(from: 0, to: path.count, by: step).map {
                 path[$0].location.applying(stroke.transform)
             } + [path[path.count - 1].location.applying(stroke.transform)]
-            guard samples.allSatisfy({ $0.x.isFinite && $0.y.isFinite && contains($0, vertices: loop.vertices) }) else {
-                return nil
-            }
+            guard samples.allSatisfy({ $0.x.isFinite && $0.y.isFinite }) else { return nil }
+            // A tight circle may touch a character at its edge. Include mostly
+            // enclosed strokes, then clip the rendered pixels to the polygon.
+            let contained = samples.filter { contains($0, vertices: loop.vertices) }.count
+            guard contained * 10 >= samples.count * 7 else { return nil }
             return index
         }
     }
@@ -128,7 +130,13 @@ enum StudyPurpleCapture {
             let image = UIGraphicsImageRenderer(size: crop.size, format: format).image { renderer in
                 UIColor.white.setFill()
                 renderer.cgContext.fill(CGRect(origin: .zero, size: crop.size))
+                renderer.cgContext.saveGState()
+                let outline = loop.vertices.map { CGPoint(x: $0.x - crop.minX, y: $0.y - crop.minY) }
+                renderer.cgContext.addLines(between: outline)
+                renderer.cgContext.closePath()
+                renderer.cgContext.clip()
                 pixels.image(from: crop, scale: format.scale).draw(in: CGRect(origin: .zero, size: crop.size))
+                renderer.cgContext.restoreGState()
             }
             guard let png = image.pngData(), !png.isEmpty, png.count <= 180_000 else {
                 throw StudyAIError.tooMuchInk
