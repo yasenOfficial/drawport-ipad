@@ -1,4 +1,5 @@
 import Foundation
+import PencilKit
 import UIKit
 
 /// A kept AI answer is an app-private page object, never PencilKit ink.
@@ -8,14 +9,25 @@ struct StudyAnswerNote: Codable, Identifiable {
     var sourceSHA256: String
     var recognizedQuestion: String
     var answer: String
+    // Reversible archive of ONLY the purple context strokes hidden at Keep.
+    // Older page-answer sidecars decode with nil; no source ink is migrated.
+    var hiddenPurpleInk: Data? = nil
     var x: Double
     var y: Double
 
     func validate() throws {
         guard sourceSHA256.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
               (2...700).contains(recognizedQuestion.count), (1...4_000).contains(answer.count),
-              x.isFinite, y.isFinite, (0...4_000).contains(x), (0...4_000).contains(y) else {
+              x.isFinite, y.isFinite, (0...4_000).contains(x), (0...4_000).contains(y),
+              (hiddenPurpleInk?.count ?? 0) <= 1_000_000 else {
             throw StudyAIError.server
+        }
+        if let hiddenPurpleInk {
+            guard let drawing = try? PKDrawing(data: hiddenPurpleInk),
+                  !drawing.strokes.isEmpty, drawing.strokes.count <= 1_200,
+                  drawing.strokes.allSatisfy({ QuestionInk.matches($0.ink.color) }) else {
+                throw StudyAIError.server
+            }
         }
     }
 }
@@ -37,9 +49,9 @@ final class StudyAnswerStore {
         let file = path(book: book, page: page)
         guard FileManager.default.fileExists(atPath: file.path) else { return [] }
         let data = try Data(contentsOf: file)
-        guard data.count <= 80_000 else { throw StudyAIError.server }
+        guard data.count <= 1_500_000 else { throw StudyAIError.server }
         let document = try JSONDecoder().decode(Document.self, from: data)
-        guard document.version == 1, document.notebook == book, document.page == page,
+        guard [1, 2].contains(document.version), document.notebook == book, document.page == page,
               document.notes.count <= 8, Set(document.notes.map(\.id)).count == document.notes.count else {
             throw StudyAIError.server
         }
@@ -50,8 +62,8 @@ final class StudyAnswerStore {
         guard notes.count <= 8, Set(notes.map(\.id)).count == notes.count else { throw StudyAIError.server }
         try notes.forEach { try $0.validate() }
         _ = try load(book: book, page: page) // Preserve an unreadable sidecar.
-        let bytes = try JSONEncoder().encode(Document(version: 1, notebook: book, page: page, notes: notes))
-        guard bytes.count <= 80_000 else { throw StudyAIError.server }
+        let bytes = try JSONEncoder().encode(Document(version: 2, notebook: book, page: page, notes: notes))
+        guard bytes.count <= 1_500_000 else { throw StudyAIError.server }
         let file = path(book: book, page: page)
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
         try bytes.write(to: file, options: .atomic)
@@ -69,6 +81,7 @@ final class StudyAnswerCard: UIView {
     private let titleLabel = UILabel()
     private let status = UILabel()
     private let text = UITextView()
+    private let previewImage = UIImageView()
     private let sendButton = UIButton(type: .system)
     private let keepButton = UIButton(type: .system)
     private let closeButton = UIButton(type: .system)
@@ -109,6 +122,10 @@ final class StudyAnswerCard: UIView {
         text.textColor = .black
         text.isEditable = false
         text.accessibilityIdentifier = "studyAI.pageText"
+        previewImage.contentMode = .scaleAspectFit
+        previewImage.backgroundColor = .white
+        previewImage.isHidden = true
+        previewImage.accessibilityLabel = "Preview of ink inside the purple circle"
         sendButton.setTitle("Send recognized purple text", for: .normal)
         sendButton.addAction(UIAction { [weak self] _ in self?.onSend?() }, for: .touchUpInside)
         keepButton.setTitle("Keep answer on page", for: .normal)
@@ -120,7 +137,7 @@ final class StudyAnswerCard: UIView {
         actions.axis = .horizontal
         actions.distribution = .fillEqually
         actions.heightAnchor.constraint(equalToConstant: 38).isActive = true
-        let stack = UIStackView(arrangedSubviews: [header, status, text, actions])
+        let stack = UIStackView(arrangedSubviews: [header, status, previewImage, text, actions])
         stack.axis = .vertical
         stack.spacing = 5
         addSubview(stack)
@@ -149,13 +166,27 @@ final class StudyAnswerCard: UIView {
         keepButton.isHidden = true
     }
     func showPreview(_ recognized: String) {
-        status.text = "Check the OCR below. Only this text is sent; no image, page or PDF."
+        status.text = "Check OCR below. Only this text is sent; no image or PDF."
+        previewImage.isHidden = true
+        text.isHidden = false
         text.text = recognized
+        sendButton.setTitle("Send recognized purple text", for: .normal)
+        sendButton.isHidden = false
+        keepButton.isHidden = true
+    }
+    func showEnclosurePreview(_ png: Data) {
+        status.text = "Only this circled image goes to the free vision model. Check it first."
+        previewImage.image = UIImage(data: png)
+        previewImage.isHidden = false
+        text.isHidden = true
+        sendButton.setTitle("Send circled image", for: .normal)
         sendButton.isHidden = false
         keepButton.isHidden = true
     }
     func beginAnswer() {
         response = ""
+        previewImage.isHidden = true
+        text.isHidden = false
         text.text = ""
         showStatus("Answering on this page…")
     }
@@ -165,6 +196,10 @@ final class StudyAnswerCard: UIView {
     }
     func finishAnswer() {
         status.text = "Preview only · Keep to save on this page; otherwise ✕ discards it."
+        keepButton.isHidden = false
+    }
+    func showSaveFailure(_ message: String) {
+        status.text = String(message.prefix(140))
         keepButton.isHidden = false
     }
     func markSaved() {

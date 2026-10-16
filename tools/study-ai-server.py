@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """Personal, loopback-only DrawPort study proxy. Tailscale Serve supplies HTTPS/tailnet access.
 
-Only an explicitly typed, bounded question is accepted. No PDF, image, stroke,
-notebook, tool execution, file retrieval, or provider credential reaches the IPA.
+Only explicitly confirmed purple OCR text or a bounded image cropped from
+inside a purple enclosure is accepted. No PDF, full page, notebook, tool
+execution, file retrieval or provider credential reaches the IPA.
 Not a multi-user/commercial service. Never log request bodies or credentials.
 """
+import base64
+import binascii
 import http.server
 import json
 import os
 from pathlib import Path
 import stat
+import struct
 import subprocess
 import threading
 import time
@@ -17,7 +21,7 @@ import urllib.error
 import urllib.request
 
 PORT = 18746
-MODEL = "liquid/lfm-2.5-2.6b:free"
+MODEL = "nvidia/nemotron-3.5-super-vl:free"
 API = "https://openrouter.ai/api/v1"
 KEY_PATH = Path.home() / ".config/drawport/openrouter.key"
 LOCK = threading.BoundedSemaphore(1)
@@ -58,7 +62,8 @@ def free_now():
         models = json.load(response).get("data", [])
     candidate = next((item for item in models if item.get("id") == MODEL), None)
     return bool(candidate and candidate.get("pricing", {}).get("prompt") in ("0", "0.0")
-                and candidate.get("pricing", {}).get("completion") in ("0", "0.0"))
+                and candidate.get("pricing", {}).get("completion") in ("0", "0.0")
+                and "image" in (candidate.get("architecture", {}).get("input_modalities") or []))
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -98,21 +103,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
             count = int(self.headers.get("Content-Length", "-1"))
         except ValueError:
             count = -1
-        if not 1 <= count <= 2_000 or self.headers.get("Content-Type", "").split(";")[0] != "application/json":
-            return self.reply(413, "Question exceeds the request limit")
+        if not 1 <= count <= 250_000 or self.headers.get("Content-Type", "").split(";")[0] != "application/json":
+            return self.reply(413, "Selection exceeds the request limit")
         try:
             value = json.loads(self.rfile.read(count))
-            if not isinstance(value, dict) or set(value) != {"version", "question"} or value["version"] != 1:
+            if not isinstance(value, dict) or value.get("version") != 1:
                 raise ValueError()
-            question = value["question"]
-            if not isinstance(question, str) or not 1 <= len(question.strip()) <= 700 or "\x00" in question:
+            if set(value) == {"version", "question"}:
+                question = value["question"]
+                if not isinstance(question, str) or not 1 <= len(question.strip()) <= 700 or "\x00" in question:
+                    raise ValueError()
+                selected = (question.strip(), None)
+            elif set(value) == {"version", "image"}:
+                encoded = value["image"]
+                if not isinstance(encoded, str) or len(encoded) > 240_000:
+                    raise ValueError()
+                png = base64.b64decode(encoded, validate=True)
+                if not 1 <= len(png) <= 180_000 or png[:8] != b'\x89PNG\r\n\x1a\n' or png[12:16] != b'IHDR':
+                    raise ValueError()
+                width, height = struct.unpack('>II', png[16:24])
+                if not 1 <= width <= 1_200 or not 1 <= height <= 1_200 or width * height > 1_200_000:
+                    raise ValueError()
+                selected = (None, encoded)
+            else:
                 raise ValueError()
-        except (ValueError, UnicodeError):
-            return self.reply(400, "Enter one short question")
+        except (ValueError, UnicodeError, binascii.Error, struct.error):
+            return self.reply(400, "Invalid purple-ink selection")
         if not LOCK.acquire(blocking=False):
             return self.reply(429, "A study request is already running")
         try:
-            self.answer(question.strip())
+            self.answer(*selected)
         finally:
             LOCK.release()
 
@@ -121,16 +141,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(b"data: " + data + b"\n\n")
         self.wfile.flush()
 
-    def answer(self, question):
+    def answer(self, question, image):
         stream_open = False
         try:
             key = credential()
             if not free_now():
                 return self.reply(503, "The chosen model is not currently free")
+            system = ("You are a Bulgarian STUDY ASSISTANT. Verify the circled student's work or "
+                      "explain/solve the question; check arithmetic and mathematical steps instead of guessing. "
+                      "Use only the supplied text or cropped image. State uncertainty when handwriting cannot "
+                      "be read. Never claim to have read a whole notebook or PDF. No tools, no invented sources. "
+                      "Answer concisely in plain text without Markdown or asterisks.")
+            content = question if image is None else [
+                {"type": "text", "text": "Това е изрязано изображение САМО на мастилото вътре в лилаво заграждение; самата лилава линия е премахната нарочно. Не обсъждай липсата на рамка. Прочети видимия текст, провери решението или обясни задачата кратко НА БЪЛГАРСКИ. При нечетлив почерк кажи го."},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64," + image}}]
             payload = {"model": MODEL, "messages": [
-                {"role": "system", "content": "You are a concise Bulgarian study tutor. Answer in plain text only (no Markdown, headings or asterisks), preferably under 120 words. Explain accurately. Never invent sources or claim to have read a PDF. No tools. If unsure, say so."},
-                {"role": "user", "content": question}],
-                "temperature": 0, "max_tokens": 420, "reasoning": {"max_tokens": 32},
+                {"role": "system", "content": system},
+                {"role": "user", "content": content}],
+                "temperature": 0, "max_tokens": 500, "reasoning": {"effort": "none"},
                 "stream": True, "stream_options": {"include_usage": True}}
             request = urllib.request.Request(API + "/chat/completions",
                 data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
