@@ -348,8 +348,13 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
     private let aiObjects = AIObjectsView()
     private let graphOverlay = StudyGraphOverlay()
     private lazy var graphStore = StudyGraphStore(root: store.fileRoot)
+    private lazy var visualStore = StudyVisualStore(root: store.fileRoot)
     private lazy var referenceStore = StudyReferenceStore(root: store.fileRoot)
     private var studyGraphs: [StudyGraph] = []
+    private var studyVisuals: [StudyVisualAsset] = []
+    // Explicit cross-folder references are session-only, never silently carried
+    // across an app relaunch or forwarded to the unconfigured AI endpoint.
+    private var selectedReferencesByNotebook: [UUID: Set<UUID>] = [:]
     private var aiButton: UIButton?
     private var aiJournal: AINetworkJournal?
     private lazy var aiClient = injectedAIClient ?? AIClient(endpoint: DrawEndpoints.configured("ai"), token: DrawEndpoints.token)
@@ -516,6 +521,7 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         graphOverlay.removeFromSuperview()
         graphOverlay.subviews.forEach { $0.removeFromSuperview() }
         studyGraphs = []
+        studyVisuals = []
         squeezeInteraction.isEnabled = false
         if #available(iOS 26.0, *) {
             canvas.pencilKitResponderState.toolPickerVisibility = .inactive
@@ -1679,6 +1685,8 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         mutate { try aiObjects.load(store.objects(book: bookID, page: page), store: store) }
         do { studyGraphs = try graphStore.load(book: bookID, page: page.id) }
         catch { studyGraphs = []; failure(error) }
+        do { studyVisuals = try visualStore.load(book: bookID, page: page.id, availableSources: visualSources()) }
+        catch { studyVisuals = []; failure(error) }
         for child in [paper, aiObjects, canvas, graphOverlay] {
             child.translatesAutoresizingMaskIntoConstraints = false
             NSLayoutConstraint.activate([
@@ -1692,9 +1700,11 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
         let bounds = drawing.bounds
         let objects = store.objects(book: bookID, page: page)
         pageInkSize = CGSize(width: max(bounds.isNull ? 0 : bounds.maxX, CGFloat(objects.map { $0.frame.x + $0.frame.width }.max() ?? 0),
-                                      CGFloat(studyGraphs.map { $0.x + Double(StudyGraphCard.cardSize.width) }.max() ?? 0)),
+                                      CGFloat(studyGraphs.map { $0.x + Double(StudyGraphCard.cardSize.width) }.max() ?? 0),
+                                      CGFloat(studyVisuals.map { $0.x * max(0, Double(documentPageSize.width) - $0.width) + $0.width }.max() ?? 0)),
                              height: max(bounds.isNull ? 0 : bounds.maxY, CGFloat(objects.map { $0.frame.y + $0.frame.height }.max() ?? 0),
-                                         CGFloat(studyGraphs.map { $0.y + Double(StudyGraphCard.cardSize.height) }.max() ?? 0)))
+                                         CGFloat(studyGraphs.map { $0.y + Double(StudyGraphCard.cardSize.height) }.max() ?? 0),
+                                         CGFloat(studyVisuals.map { $0.y * max(0, Double(documentPageSize.height) - $0.height) + $0.height }.max() ?? 0)))
         reloadStudyGraphCards()
         setDrawing(drawing)
         applyTool()
@@ -1749,11 +1759,38 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
             card.onExport = { [weak self] graph in self?.exportInteractiveGraph(graph) }
             graphOverlay.addSubview(card)
         }
+        for asset in studyVisuals {
+            let card = StudyVisualCard(asset: asset, pageSize: documentPageSize)
+            card.onCommit = { [weak self] changed in
+                guard let self, let book = self.bookID, let page = self.pageID,
+                      let index = self.studyVisuals.firstIndex(where: { $0.id == changed.id }) else { return }
+                var updated = self.studyVisuals
+                updated[index] = changed
+                do {
+                    try self.visualStore.save(updated, book: book, page: page, availableSources: self.visualSources())
+                    self.studyVisuals = updated
+                } catch {
+                    self.failure(error)
+                    self.reloadStudyGraphCards()
+                }
+            }
+            card.onRemove = { [weak self] id in self?.confirmVisualRemoval(id) }
+            graphOverlay.addSubview(card)
+        }
     }
+
+    private func visualSources() throws -> Set<UUID> { Set(try referenceStore.all().map(\.id)) }
 
     private func showStudyReferences() {
         guard presentedViewController == nil else { return }
-        let library = StudyReferenceLibrary(store: referenceStore)
+        let folderID = bookID.flatMap { store.notebook($0)?.folderID }
+        let library = StudyReferenceLibrary(store: referenceStore, notebooks: store,
+                                             activeNotebookID: bookID, activeNotebookFolderID: folderID,
+                                             pinnedIDs: bookID.flatMap { selectedReferencesByNotebook[$0] } ?? [])
+        library.onPinsChange = { [weak self, id = bookID] pins in
+            guard let self, let id else { return }
+            self.selectedReferencesByNotebook[id] = pins
+        }
         let navigation = UINavigationController(rootViewController: library)
         navigation.modalPresentationStyle = .pageSheet
         present(navigation, animated: true)
@@ -1768,9 +1805,46 @@ final class DrawController: UIViewController, PKCanvasViewDelegate, PKToolPicker
                 self?.addStudyGraph(kind)
             })
         }
+        if studyVisuals.count < 8 {
+            alert.addAction(UIAlertAction(title: "3D vectors · offline example", style: .default) { [weak self] _ in
+                self?.addExample3DVectors()
+            })
+        }
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         alert.popoverPresentationController?.sourceView = view
         alert.popoverPresentationController?.sourceRect = CGRect(x: view.bounds.midX, y: view.bounds.midY, width: 1, height: 1)
+        present(alert, animated: true)
+    }
+
+    private func addExample3DVectors() {
+        guard let book = bookID, let page = pageID, studyVisuals.count < 8 else { return }
+        let asset = StudyVisualAsset(id: UUID(), kind: .vectors3D, caption: "3D vectors · drag to rotate",
+                                     trigger: .requested, width: 500, height: 360, x: 0.12, y: 0.18,
+                                     sourceIDs: [], parameters: nil, plot: nil,
+                                     vectors: [.init(label: "a", x: 3, y: 2, z: 1, color: .blue),
+                                               .init(label: "b", x: -1, y: 1, z: 2, color: .red)],
+                                     primitives: nil, table: nil)
+        do {
+            try visualStore.save(studyVisuals + [asset], book: book, page: page, availableSources: visualSources())
+            studyVisuals.append(asset)
+            reloadStudyGraphCards()
+        } catch { failure(error) }
+    }
+
+    private func confirmVisualRemoval(_ id: UUID) {
+        guard let book = bookID, let page = pageID,
+              studyVisuals.contains(where: { $0.id == id }), presentedViewController == nil else { return }
+        let alert = UIAlertController(title: "Remove visual?", message: "Handwritten ink is not changed.", preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Remove", style: .destructive) { [weak self] _ in
+            guard let self, self.bookID == book, self.pageID == page else { return }
+            let updated = self.studyVisuals.filter { $0.id != id }
+            do {
+                try self.visualStore.save(updated, book: book, page: page, availableSources: self.visualSources())
+                self.studyVisuals = updated
+                self.reloadStudyGraphCards()
+            } catch { self.failure(error) }
+        })
         present(alert, animated: true)
     }
 

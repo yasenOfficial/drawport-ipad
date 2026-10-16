@@ -8,7 +8,9 @@ Current UI prototype: dark chrome with warm-white paper, configurable toolbar pl
 
 ## Local study tools (experimental)
 
-The notebook options menu offers offline interactive linear/quadratic/sine graphs with a larger plot, an editable parameter slider and values table. Graphs live in atomic, page-keyed sidecars under the app's local `InteractiveGraphs` directory; an individual graph exports as self-contained interactive HTML. These graph sidecars are **not yet included in DrawPort sync or notebook PDF exports**; back up the app container before relying on them. The PDF reference library imports source documents locally, supports text search and highlighted exact matches, and does not upload imports. Scanned-image PDF pages need OCR before text search can locate a quotation. These are local building blocks, **not AI-generated corrections, automatic citations or a deployed AI service**.
+The notebook options menu offers offline interactive linear/quadratic/sine graphs: parameter value and slider share one compact row, and an icon toggles the values table. Graphs live in atomic page-keyed `InteractiveGraphs` sidecars; an individual legacy graph exports as self-contained interactive HTML. The same menu has an **offline sample of rotatable 3D vectors**. `StudyVisualProtocol.swift` defines a versioned, validated JSON proposal for 2D functions, 3D surfaces/vectors, safe vector diagrams and tables; UIKit renders local accepted/test data with sliders and rotation. Visual sidecars are saved atomically under `InteractiveVisuals`. **Neither type of sidecar is included in DrawPort sync or notebook PDF exports yet**; back up the app container before relying on them.
+
+Resources mirrors notebook folders and imports PDFs locally without uploading them; existing flat-library PDFs stay Unassigned. Its header and row checkmarks show the exact active folder scope, and out-of-folder files require an explicit session pin. Child folders/older semesters are never included automatically. Local PDFKit text search highlights matches; scanned PDFs need OCR. **No AI answer is connected to Resources or these visuals yet**, and the installed AI button remains a safe unavailable message. Details and outstanding work: [scoped references and visual protocol](docs/study-reference-plan.md), [JSON example](docs/visual-proposal-v1.example.json).
 
 A user-provided opaque Sigma app icon is stored at `branding/AppIcon.png`. The current Linux `xtool` cannot compile an asset catalog; a local private signing stage can add `AppIcon.png` and corresponding Info.plist keys **before signing**. This repository does not contain the private signer, a signed IPA, or account information. The display name and bundle identifier remain DrawPort pending a naming decision.
 
@@ -20,7 +22,7 @@ Use Swift 6+ with an iPadOS SDK and [xtool](https://github.com/xtool-org/xtool):
 xtool dev build --ipa
 ```
 
-This produces an **unsigned** IPA. Update `xtool.yml` to your own stable bundle ID and sign it yourself before installing. Neither Apple credentials nor device pairing records belong in this repository. The iPadOS 18 fallback in `PortablePage.swift` rejects stroke thresholds that only iOS 26 can represent rather than silently changing geometry. There are no compiled or real-device regression tests for this fork yet.
+This produces an **unsigned** IPA. Update `xtool.yml` to your own stable bundle ID and sign it yourself before installing. Neither Apple credentials nor device pairing records belong in this repository. The iPadOS 18 fallback in `PortablePage.swift` rejects stroke thresholds that only iOS 26 can represent rather than silently changing geometry. A Foundation-only protocol/sidecar self-test lives under `Tests/` and can be compiled on Linux; it is **not** a substitute for visual Pencil/iPad and persistence regression tests.
 
 ## Limitations
 

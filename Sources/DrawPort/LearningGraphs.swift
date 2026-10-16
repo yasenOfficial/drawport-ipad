@@ -183,11 +183,6 @@ final class StudyGraphCard: UIView {
             guard let self else { return }
             self.onExport?(self.graph)
         }, for: .touchUpInside)
-        let header = UIStackView(arrangedSubviews: [title, export, remove])
-        header.axis = .horizontal
-        header.spacing = 8
-        export.widthAnchor.constraint(equalToConstant: 36).isActive = true
-        remove.widthAnchor.constraint(equalToConstant: 36).isActive = true
         plot.graph = graph
         value.textColor = .darkGray
         value.font = .monospacedDigitSystemFont(ofSize: 14, weight: .medium)
@@ -203,9 +198,15 @@ final class StudyGraphCard: UIView {
             }, for: event)
         }
         let tableButton = UIButton(type: .system)
-        tableButton.setTitle("Values ↔ Graph", for: .normal)
+        tableButton.setImage(UIImage(systemName: "tablecells"), for: .normal)
         tableButton.accessibilityLabel = "Toggle graph values table"
         tableButton.addAction(UIAction { [weak self] _ in self?.toggleTable() }, for: .touchUpInside)
+        let header = UIStackView(arrangedSubviews: [title, tableButton, export, remove])
+        header.axis = .horizontal
+        header.spacing = 8
+        for control in [tableButton, export, remove] {
+            control.widthAnchor.constraint(equalToConstant: 36).isActive = true
+        }
         table.font = .monospacedSystemFont(ofSize: 14, weight: .regular)
         table.textAlignment = .center
         table.textColor = .black
@@ -222,7 +223,12 @@ final class StudyGraphCard: UIView {
                 child.trailingAnchor.constraint(equalTo: plotContainer.trailingAnchor)
             ])
         }
-        let stack = UIStackView(arrangedSubviews: [header, plotContainer, value, slider, tableButton])
+        let parameterRow = UIStackView(arrangedSubviews: [slider, value])
+        parameterRow.axis = .horizontal
+        parameterRow.alignment = .center
+        parameterRow.spacing = 10
+        value.widthAnchor.constraint(equalToConstant: 86).isActive = true
+        let stack = UIStackView(arrangedSubviews: [header, plotContainer, parameterRow])
         stack.axis = .vertical
         stack.spacing = 4
         addSubview(stack)
@@ -233,9 +239,7 @@ final class StudyGraphCard: UIView {
             stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             header.heightAnchor.constraint(equalToConstant: 32),
-            value.heightAnchor.constraint(equalToConstant: 20),
-            slider.heightAnchor.constraint(equalToConstant: 28),
-            tableButton.heightAnchor.constraint(equalToConstant: 28)
+            parameterRow.heightAnchor.constraint(equalToConstant: 32)
         ])
         updateValues()
     }
